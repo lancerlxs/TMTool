@@ -9,17 +9,20 @@
 import sys
 import os
 import shutil
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+# 使用 PyQt5（Qt5）替代 PySide6（Qt6），以兼容 Python 3.8。
+# PyQt5 中信号为 pyqtSignal，通过别名统一为 Signal，保持下游写法不变。
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QStackedWidget, QCheckBox,
                              QProgressBar)
-from PySide6.QtCore import Qt, QThread, Signal, QRegularExpression
-from PySide6.QtGui import QFont, QRegularExpressionValidator
-import cv2
-import numpy as np
+from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QRegularExpression
+from PyQt5.QtGui import QFont, QRegularExpressionValidator
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# 注：cv2 与 numpy 已改为在 AutoPagingWorker.add_number_to_image 中延迟导入，
+# 以提升 Win7 下的健壮性（opencv 在 Win7 上较易出现 DLL 加载失败），
+# 这样即使该依赖缺失或损坏，主程序仍可启动、其他功能页仍可使用。
 import time
 import threading
 from datetime import datetime
@@ -458,7 +461,7 @@ class FileRenamePage(FunctionPage):
             return
         
         # 清空之前的结果
-        self.log_widget.clear()
+        self.log_box.clear()
         
         self.log("="*50)
         self.log("正在预览操作...")
@@ -698,6 +701,10 @@ class AutoPagingWorker(QThread):
     def add_number_to_image(self, image_path, number):
         """在图片右上角添加数字"""
         try:
+            # cv2/numpy 延迟导入：Win7 上 opencv 较易出现 DLL 加载失败，
+            # 放在此处可避免影响主程序启动与其他功能页（导入失败会被下方 except 捕获）。
+            import cv2
+            import numpy as np
             img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 return False
@@ -1339,7 +1346,7 @@ class ArchiveStampPage(FunctionPage):
             return
         
         # 清空之前的结果
-        self.log_widget.clear()
+        self.log_box.clear()
         
         self.log("="*50)
         self.log("正在预览操作...")
@@ -2275,7 +2282,7 @@ class JpgToPdfPage(FunctionPage):
             return
         
         # 清空之前的结果
-        self.log_widget.clear()
+        self.log_box.clear()
         
         self.log("="*50)
         self.log("正在预览操作...")
@@ -2659,7 +2666,7 @@ class PdfToOfdPage(FunctionPage):
             return
         
         # 清空之前的结果
-        self.log_widget.clear()
+        self.log_box.clear()
         
         self.log("="*50)
         self.log("正在预览操作...")
