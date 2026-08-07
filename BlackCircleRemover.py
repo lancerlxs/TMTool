@@ -6,6 +6,7 @@
 
 import sys
 import os
+import re
 import math
 import shutil
 from pathlib import Path
@@ -15,26 +16,144 @@ import numpy as np
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
-                             QFileDialog, QTextEdit, QSpinBox, QFormLayout,
-                             QGroupBox, QMessageBox, QCheckBox, QSplitter,
-                             QScrollArea, QProgressBar)
+                             QFileDialog, QTextEdit, QSpinBox,
+                             QFormLayout, QGroupBox, QMessageBox, QCheckBox,
+                             QProgressBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal
-from PyQt5.QtGui import QFont, QPixmap, QImage
+from PyQt5.QtGui import QFont
+
+
+def _projection_skew(pil_img, max_angle=8.0):
+    """
+    投影方差法估计偏斜角(度)。返回 (最佳旋转角, 置信比)。
+    旋转角 = 让内容水平所需的旋转角(PIL 语义：正值=逆时针)。精度约 0.02°。
+    置信比 = 最佳角处水平投影方差 / 0°处方差；>1 真实偏斜，≈1 无偏斜/信号弱。
+    预处理：Otsu 二值化 → 去过大连通域(黑斑/边框) → 水平闭运算增强行信号。
+    需要 cv2；无 cv2 返回 (0, 1)。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return 0.0, 1.0
+
+    gray = pil_img.convert('L')
+    W, H = gray.size
+    sc = 1500.0 / max(W, H)  # 降采样加速
+    sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
+    small = np.array(gray.resize((sw, sh)))
+
+    # Otsu 自适应二值化（内容为前景）
+    _, otsu = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    mask = (otsu > 0).astype(np.uint8)
+
+    # 去掉过大的连通域(黑斑/装订孔块/边框等干扰)，保留文字笔画
+    n_cc, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    max_area = int(0.0015 * sw * sh)
+    keep = np.ones(mask.shape, dtype=bool)
+    for i in range(1, n_cc):
+        if stats[i, cv2.CC_STAT_AREA] > max_area:
+            keep[labels == i] = False
+    mask = ((mask > 0) & keep).astype(np.uint8)
+
+    # 水平闭运算：把同一行文字连成横向条带，增强行投影信号
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 1))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    center = (sw / 2.0, sh / 2.0)
+
+    def var_at(ang):
+        M = cv2.getRotationMatrix2D(center, ang, 1.0)
+        rot = cv2.warpAffine(mask, M, (sw, sh), flags=cv2.INTER_NEAREST)
+        return int(rot.sum(axis=1).var())
+
+    v0 = var_at(0.0)
+    coarse = max(np.arange(-max_angle, max_angle + 1e-6, 0.1), key=var_at)        # 粗搜 0.1°
+    fine = max(np.arange(coarse - 0.1, coarse + 0.1 + 1e-6, 0.02), key=var_at)    # 细搜 0.02°
+    ratio = (var_at(fine) / v0) if v0 > 0 else 1.0
+    return round(float(fine), 2), round(ratio, 2)
+
+
+def _hough_skew(pil_img, min_count=30):
+    """
+    Hough直线法估计偏斜角(度)。返回 (角度, 近水平线根数=置信度)。
+    对投影法不敏感的小角度(约1°)文字/表单图更灵敏。
+    角度已与 PIL rotate 对齐(正值=逆时针，直接用于纠偏)。需要 cv2；无 cv2 返回 (0, 0)。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return 0.0, 0
+
+    gray = pil_img.convert('L')
+    W, H = gray.size
+    sc = 1500.0 / max(W, H)
+    sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
+    small = np.array(gray.resize((sw, sh)))
+    edges = cv2.Canny(small, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=max(20, sw // 8), maxLineGap=20)
+    angs = []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if ang > 90:
+                ang -= 180
+            elif ang <= -90:
+                ang += 180
+            if -8 < ang < 8:  # 近水平线(文字行方向)；真实偏斜<8°，更大角度是斜线/图形
+                angs.append(ang)
+    if len(angs) >= min_count:
+        return round(float(np.median(angs)), 2), len(angs)
+    return 0.0, len(angs)
+
+
+def _estimate_skew(pil_img, max_angle=8.0):
+    """
+    估计图像内容偏斜角(度)。返回 (旋转角, 置信比)。
+    优先用投影方差法；若其信号弱(置信比<1.2)，回退到 Hough 直线法
+    (对小角度约1°的文字/表单图更灵敏)。两种方法的角度都已与 PIL rotate 对齐。
+    """
+    ang, ratio = _projection_skew(pil_img, max_angle)
+    if ratio >= 1.2 and abs(ang) >= 0.1:
+        return ang, ratio
+    # 投影法信号不足：回退 Hough 直线法
+    ang_h, conf = _hough_skew(pil_img)
+    if conf >= 30 and abs(ang_h) >= 0.1:
+        return ang_h, 2.0  # Hough 高置信，合成 ratio 让 _deskew_image 放行
+    return 0.0, 1.0
+
+
+def _deskew_image(pil_img, fillcolor=(255, 255, 255), min_angle=0.1, min_ratio=1.2):
+    """
+    对图像做纯旋转纠偏(自动检测)。返回 (结果Image, 应用的角度；未纠偏时为 0.0)。
+    仅当 |偏斜角|>=min_angle(0.1°) 且 置信比>=min_ratio(1.2) 时才纠偏。
+    真实偏斜经预处理后置信比通常>=1.3，平整页≈1.0；1.2 兼顾灵敏与抗误报。
+    纯旋转(无缩放/剪切)→ 内容不变形；expand=False 保持原尺寸，
+    旋出的边角用 fillcolor 填充(默认白)。
+    """
+    ang, ratio = _estimate_skew(pil_img)
+    if abs(ang) < min_angle or ratio < min_ratio:
+        return pil_img, 0.0
+    out = pil_img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=fillcolor)
+    return out, ang
 
 
 class CircleDetectionWorker(QThread):
-    """黑色圆圈检测后台工作线程（单线程处理）"""
+    """黑色圆圈检测后台工作线程（多线程处理）"""
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
     result_signal = Signal(list)  # 发送处理结果列表
     finished_signal = Signal(bool, str)
 
-    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, parent=None):
+    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, deskew=False, remove_border=True, thread_count=4, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.max_diameter_mm = max_diameter_mm  # 最大直径（毫米），默认25mm(2.5cm)
         self.margin_mm = margin_mm  # 两侧边距（毫米），默认40mm(4cm)
+        self.deskew = deskew  # 是否在处理前对图像纠偏(去倾斜)
+        self.remove_border = remove_border  # 是否去除扫描黑边/阴影
+        self.thread_count = thread_count  # 并发线程数
         self.is_stopped = False
         # 假设300 DPI进行像素转换
         self.dpi_assumption = 300
@@ -43,7 +162,9 @@ class CircleDetectionWorker(QThread):
 
     def run(self):
         try:
-            # 收集所有JPG文件
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import threading
+
             jpg_files = []
             for root, dirs, files in os.walk(self.input_dir):
                 if self.is_stopped:
@@ -52,75 +173,112 @@ class CircleDetectionWorker(QThread):
                     if filename.lower().endswith(('.jpg', '.jpeg')):
                         jpg_files.append(os.path.join(root, filename))
 
+            def _natural_key(path):
+                return [int(t) if t.isdigit() else t.lower()
+                        for t in re.split(r'(\d+)', path)]
+            jpg_files.sort(key=_natural_key)
+
             total = len(jpg_files)
             if total == 0:
                 self.finished_signal.emit(False, "未找到任何JPG/JPEG文件")
                 return
 
-            self.log_signal.emit(f"找到 {total} 个JPG文件，开始检测黑色圆圈...")
+            self.log_signal.emit(f"找到 {total} 个JPG文件，{self.thread_count}线程并行处理...")
 
             results = []
-            processed = 0
-            # 崩溃日志：记录“正在处理”的文件。进程被系统杀死(如内存耗尽)时无 Python
-            # 异常信息，此文件可定位元凶；正常结束后自动删除。
-            crash_log = os.path.join(self.output_dir, '_processing.log')
-            try:
-                os.makedirs(self.output_dir, exist_ok=True)
-                with open(crash_log, 'w', encoding='utf-8') as cf:
-                    cf.write(f"开始处理 {total} 个文件\n")
-            except Exception:
-                crash_log = None
+            processed = [0]
+            deskew_count = [0]
+            holed_file_count = [0]
+            hole_count_total = [0]
+            lock = threading.Lock()
 
-            for jpg_path in jpg_files:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(self.output_dir, f"处理日志_{timestamp}.txt")
+            os.makedirs(self.output_dir, exist_ok=True)
+            logf = open(log_path, 'w', encoding='utf-8')
+            log_lock = threading.Lock()
+
+            def wlog(s):
+                with log_lock:
+                    logf.write(s + "\n")
+                    logf.flush()
+
+            wlog("黑色圆洞（装订孔）检测与裁剪 - 处理日志")
+            wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"输入目录: {self.input_dir}")
+            wlog(f"输出目录: {self.output_dir}")
+            wlog(f"圆圈最大直径: {self.max_diameter_mm}mm；纠偏: {'开启' if self.deskew else '关闭'}；线程数: {self.thread_count}")
+            wlog("=" * 70)
+
+            def process_one(jpg_path, idx):
                 if self.is_stopped:
-                    break
-
-                # 先记录正在处理的文件（GUI 日志 + 同步写文件），便于崩溃定位
+                    return
                 self.log_signal.emit(f"处理中: {os.path.basename(jpg_path)}")
-                if crash_log:
-                    try:
-                        with open(crash_log, 'a', encoding='utf-8') as cf:
-                            cf.write(f">>> {jpg_path}\n")
-                            cf.flush()
-                    except Exception:
-                        pass
-
+                wlog(f"[{idx}/{total}] 正在处理: {jpg_path}")
                 try:
                     result = self.process_image(jpg_path)
-                    results.append(result)
-                    
-                    status = "✓ 已裁剪" if result['success'] else "✗ 失败"
-                    circle_info = f"发现{result['circles_found']}个圆圈" if result['success'] else ""
-                    self.log_signal.emit(
-                        f"{status} {os.path.basename(jpg_path)} - {circle_info} {result.get('error_msg', '')}")
-
                 except Exception as e:
-                    error_msg = f"处理文件失败 {os.path.basename(jpg_path)}: {str(e)}"
-                    self.log_signal.emit(error_msg)
-                    results.append({
-                        'path': jpg_path,
-                        'filename': os.path.basename(jpg_path),
-                        'success': False,
-                        'error_msg': str(e),
-                        'circles_found': 0
-                    })
+                    result = {'path': jpg_path, 'filename': os.path.basename(jpg_path),
+                              'success': False, 'error_msg': str(e),
+                              'circles_found': 0, 'deskew_angle': 0.0}
+                with lock:
+                    results.append(result)
+                    holes = result.get('circles_found', 0)
+                    hole_count_total[0] += holes
+                    if holes > 0:
+                        holed_file_count[0] += 1
+                    da = result.get('deskew_angle', 0.0) or 0.0
+                    if da:
+                        deskew_count[0] += 1
+                    processed[0] += 1
+                    if result['success']:
+                        parts = [f"✓ {os.path.basename(jpg_path)}"]
+                        if self.deskew:
+                            parts.append(f"纠偏{da}°" if da else "无需纠偏")
+                        parts.append(f"装订孔{holes}个" if holes else "无装订孔")
+                        self.log_signal.emit("  ".join(parts))
+                    else:
+                        self.log_signal.emit(f"✗ {os.path.basename(jpg_path)} - 失败 {result.get('error_msg', '')}")
+                    wlog(f"  装订孔: {'检测并填充 %d 个' % holes if holes else '未检测到'}")
+                    if self.deskew:
+                        wlog(f"  纠偏: {'已纠正 %.2f°' % da if da else '无明显偏斜，未纠偏'}")
+                    wlog(f"  结果: {'成功' if result['success'] else '失败: ' + str(result.get('error_msg', ''))}")
+                    wlog(f"  输出: {result.get('output_path', '')}")
+                    self.progress_signal.emit(processed[0], total)
 
-                processed += 1
-                self.progress_signal.emit(processed, total)
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                futures = {}
+                for idx, jpg_path in enumerate(jpg_files, 1):
+                    if self.is_stopped:
+                        break
+                    future = executor.submit(process_one, jpg_path, idx)
+                    futures[future] = jpg_path
+                for future in as_completed(futures):
+                    if self.is_stopped:
+                        for f in futures:
+                            f.cancel()
+                        break
+                    future.result()
+
+            wlog("=" * 70)
+            wlog(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            success_count = sum(1 for r in results if r['success'])
+            wlog(f"总计文件: {processed[0]}（成功 {success_count}，失败 {processed[0] - success_count}）")
+            wlog(f"去装订孔: {holed_file_count[0]} 个文件，共 {hole_count_total[0]} 个孔")
+            wlog(f"纠偏: {deskew_count[0]} 个文件")
+            if self.is_stopped:
+                wlog("注意：处理被用户中途停止")
+            logf.close()
+            self.log_signal.emit(f"已生成处理日志: {os.path.basename(log_path)}")
 
             if not self.is_stopped:
                 self.result_signal.emit(results)
-                success_count = sum(1 for r in results if r['success'])
-                msg = f"处理完成！共检查 {processed} 个文件，成功裁剪 {success_count} 个文件"
-                # 正常结束，删除崩溃日志
-                if crash_log and os.path.exists(crash_log):
-                    try:
-                        os.remove(crash_log)
-                    except Exception:
-                        pass
+                msg = (f"处理完成！共 {processed[0]} 个文件，成功 {success_count}；"
+                       f"去孔 {holed_file_count[0]} 文件/{hole_count_total[0]} 个；"
+                       f"纠偏 {deskew_count[0]} 个文件。日志: {os.path.basename(log_path)}")
                 self.finished_signal.emit(True, msg)
             else:
-                self.finished_signal.emit(False, "处理已停止")
+                self.finished_signal.emit(False, f"处理已停止。日志: {os.path.basename(log_path)}")
 
         except Exception as e:
             self.finished_signal.emit(False, f"处理出错: {str(e)}")
@@ -140,57 +298,28 @@ class CircleDetectionWorker(QThread):
             img.load()  # 立即解码，及时暴露损坏文件
             if img.mode not in ('RGB', 'L'):
                 img = img.convert('RGB')
+            # 可选：纠偏(去倾斜)——纯旋转，内容不变形；之后再做圆洞检测
+            deskew_applied = 0.0
+            if self.deskew:
+                img, deskew_applied = _deskew_image(img)
             orig_w, orig_h = img.size
 
-            # --- 原图分辨率灰度/掩码：用于边距带打孔洞检测 ---
-            # 保持原分辨率，避免降采样把小圆洞缩到无法与噪点区分
+            # --- 先检测+填充装订孔（在去黑边之前！）---
+            # 去黑边用更宽的灰度阈值(page_bg-60)，会把孔和附近的暗块连成大块一并填掉，
+            # 导致后续检测不到孔。先在 <50 严格阈值上检测孔，填充后再去黑边。
             arr = np.array(img)
             gray_full = (np.mean(arr, axis=2).astype(np.uint8) if arr.ndim == 3 else arr.copy())
-            mask_full = gray_full < 50
-
-            # --- 降采样图：仅用于快速判断“是否存在文字内容” ---
-            DET_MAX_EDGE = 1500
-            if max(orig_w, orig_h) > DET_MAX_EDGE:
-                sc = DET_MAX_EDGE / max(orig_w, orig_h)
-                det_w, det_h = int(orig_w * sc), int(orig_h * sc)
-                det_img = img.resize((det_w, det_h), Image.BILINEAR)
-                darr = np.array(det_img)
-                det_img.close()
-                dgray = (np.mean(darr, axis=2).astype(np.uint8) if darr.ndim == 3 else darr.copy())
-                dmask = dgray < 50
-                del darr, dgray
-            else:
-                sc = 1.0
-                det_w, det_h = orig_w, orig_h
-                dmask = mask_full
-
-            # 内容边界（降采样，阈值临时缩放）→ 判断是否有文字内容
-            orig_max_diam = self.max_diameter_pixels
-            self.max_diameter_pixels = max(5, int(orig_max_diam * sc))
-            try:
-                lb, rb = self.detect_detection_boundaries(dmask, det_w, det_h)
-            finally:
-                self.max_diameter_pixels = orig_max_diam
-            has_content = not (lb <= 0 and rb >= det_w)
-
-            # --- 检测圆洞（原图分辨率，坐标无需缩放）---
-            if has_content:
-                # 有文字内容：打孔洞紧贴纸边 → 边距带检测 + 过滤
-                circles_info = self.detect_edge_holes(mask_full, orig_w, orig_h)
-            else:
-                # 无文字（纯圆图等）：全图检测（降采样省内存），坐标映射回原图
-                raw = self.detect_circle_region(dmask, 0, det_h)
-                if sc != 1.0:
-                    inv = 1.0 / sc
-                    circles_info = [(int(round(cx * inv)), int(round(cy * inv)), int(round(r * inv)))
-                                    for cx, cy, r in raw]
-                else:
-                    circles_info = raw
-
+            mask_full = gray_full < 50  # 装订孔检测阈值(灰度<50=足够暗)
+            circles_info = self.detect_edge_holes(mask_full, orig_w, orig_h)
             del arr, gray_full, mask_full
-            if sc != 1.0:
-                del dmask
             circles_info = self._dedup_circles(circles_info)
+
+            if circles_info:
+                img = self.crop_circles(img, circles_info)
+
+            # --- 再去黑边/阴影（孔已填充为底色，不会被误连）---
+            if self.remove_border:
+                img, _br = self.remove_black_border(img)
 
             # 输出路径（保持原目录结构），确保每个文件都写入目标目录
             rel_path = os.path.relpath(image_path, self.input_dir)
@@ -198,21 +327,17 @@ class CircleDetectionWorker(QThread):
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             if circles_info:
-                # 检测到圆洞：在原图上白色填充后另存（输出保持原分辨率）
-                output_img = self.crop_circles(img, circles_info)
-                img.close()
-                output_img.save(output_path, quality=95)
-                output_img.close()
+                img.save(output_path, quality=95)
             else:
-                # 未检测到圆洞：原样复制到目标目录，保证文件完整不丢失
-                img.close()
-                shutil.copy2(image_path, output_path)
+                # 未检测到圆洞：检查去黑边是否改了图
+                img.save(output_path, quality=95)
 
             return {
                 'path': image_path,
                 'filename': os.path.basename(image_path),
                 'success': True,
                 'circles_found': len(circles_info),
+                'deskew_angle': deskew_applied,
                 'output_path': output_path,
                 'preview_before': image_path,
                 'preview_after': output_path
@@ -224,7 +349,8 @@ class CircleDetectionWorker(QThread):
                 'filename': os.path.basename(image_path),
                 'success': False,
                 'error_msg': str(e),
-                'circles_found': 0
+                'circles_found': 0,
+                'deskew_angle': 0.0
             }
 
     def detect_detection_boundaries(self, black_mask, img_width, img_height):
@@ -366,20 +492,14 @@ class CircleDetectionWorker(QThread):
         return circles
 
     def detect_edge_holes(self, mask, img_w, img_h):
-        """
-        在四条边的“边距带”(距纸边 margin_pixels 内)以原图分辨率检测打孔洞。
-        打孔洞可能在任意一条纸边上（左/右/上/下），故四条边都搜。
-        返回带边标记的候选 (cx, cy, r, edge)。
-        """
+        """Edge band hole detection (single pass, default solidity)."""
         mp = self.margin_pixels
         candidates = []
-        # 左/右边距带（竖向带，洞沿竖向成列）
         if 0 < mp < img_w // 2:
             for cx, cy, r in self.detect_circle_region(mask[:, :mp], 0, img_h):
                 candidates.append((cx, cy, r, 'L'))
             for cx, cy, r in self.detect_circle_region(mask[:, img_w - mp:], img_w - mp, img_h):
                 candidates.append((cx, cy, r, 'R'))
-        # 上/下边距带（横向带，洞沿横向成排）
         if 0 < mp < img_h // 2:
             for cx, cy, r in self.detect_circle_region(mask[:mp, :], 0, mp):
                 candidates.append((cx, cy, r, 'T'))
@@ -388,30 +508,24 @@ class CircleDetectionWorker(QThread):
         return self._filter_punch_holes(candidates, img_w, img_h)
 
     def _filter_punch_holes(self, candidates, img_w, img_h):
-        """
-        从边距带候选中保留“打孔洞”，滤除文字/边框等噪点：
-        - 按所在边(L/R/T/B)分别聚类；
-        - 竖向边(L/R)：按中心 x 聚列、要求沿 y 有足够跨度（多个洞纵向排列）；
-          横向边(T/B)：按中心 y 聚排、要求沿 x 有足够跨度；
-        - 同列/排内相对尺寸过滤，去掉混入的细小噪点。
-        “成列且沿边有跨度”是打孔洞的强特征；同行/同列的零散文字不满足，从而被滤除。
-        """
-        if len(candidates) < 2:
+        """Filter punch holes from edge candidates."""
+        if not candidates:
             return []
-        tol = max(self.max_diameter_pixels / 4, 1)       # 同列/排 聚类容差
-        spread_min = self.max_diameter_pixels            # 沿边跨度阈值
-        floor = self.max_diameter_pixels * 0.03          # 绝对最小半径
+        band = self.margin_pixels * 0.5
+        tol = max(self.max_diameter_pixels / 4, 1)
+        floor = self.max_diameter_pixels * 0.03
 
         from collections import defaultdict
         by_edge = defaultdict(list)
         for cx, cy, r, edge in candidates:
-            by_edge[edge].append((cx, cy, r))
+            # 距最近纸边的距离（四条边取最小）
+            if min(cx, img_w - 1 - cx, cy, img_h - 1 - cy) <= band:
+                by_edge[edge].append((cx, cy, r))
 
         kept = []
         for edge, comps in by_edge.items():
             vertical = edge in ('L', 'R')
-            key_idx = 0 if vertical else 1      # 聚类轴：竖向边按 x，横向边按 y
-            spread_idx = 1 if vertical else 0   # 跨度轴：竖向边沿 y，横向边沿 x
+            key_idx = 0 if vertical else 1   # 竖向边按 x 聚列，横向边按 y 聚排
             cols = []
             for c in sorted(comps, key=lambda c: c[key_idx]):
                 placed = False
@@ -422,15 +536,16 @@ class CircleDetectionWorker(QThread):
                         break
                 if not placed:
                     cols.append([c])
+            min_iso = self.max_diameter_pixels * 0.045
             for col in cols:
-                if len(col) < 2:
-                    continue
-                spread = max(c[spread_idx] for c in col) - min(c[spread_idx] for c in col)
-                if spread < spread_min:
-                    continue  # 沿边跨度不足，多为同行/同列零散文字
-                thresh = max(floor, max(c[2] for c in col) * 0.5)
-                for cx, cy, r in col:
-                    if r >= thresh:
+                if len(col) >= 2:
+                    thresh = max(floor, max(c[2] for c in col) * 0.5)
+                    for cx, cy, r in col:
+                        if r >= thresh:
+                            kept.append((cx, cy, r))
+                else:
+                    cx, cy, r = col[0]
+                    if r >= min_iso:
                         kept.append((cx, cy, r))
         return kept
 
@@ -483,7 +598,6 @@ class CircleDetectionWorker(QThread):
     def detect_circle_region(self, region_mask, offset_x, img_height):
         """
         在指定区域检测黑色圆圈
-        使用简化的轮廓检测方法
         """
         circles = []
         height, width = region_mask.shape
@@ -511,6 +625,10 @@ class CircleDetectionWorker(QThread):
             # 检查是否符合圆圈尺寸要求
             if diameter > self.max_diameter_pixels:
                 continue
+            # 实际装订孔半径通常 15-40px；超过 max_diameter*0.2(~59px=10mm半径) 的大块
+            # 不是装订孔而是印章/图形/表格区
+            if diameter > self.max_diameter_pixels * 0.4:
+                continue
 
             # 额外检查：确保是近似圆形的（不是细长的线）
             # 宽高比 = 长边 / 短边（短边至少为1，避免除零）。圆≈1.0，细线条会很大。
@@ -518,11 +636,11 @@ class CircleDetectionWorker(QThread):
             if aspect_ratio > 3:  # 如果宽高比超过3，可能是线条而非圆圈
                 continue
 
-            # 实心度(solidity)：真圆洞(实心圆盘)密度高(≈0.78)；手写笔画/线条/不规则噪点
-            # 填不满其外接框、密度低。实测：真圆洞 0.45~0.92，手写文字 0.2~0.41，阈值取 0.45。
+            # 实心度(solidity)：真圆洞(实心圆盘)密度高(≈0.78)；手写笔画/线条密度低
             bw, bh = max_col - min_col, max_row - min_row
             solidity = pixel_count / (bh * bw) if bh * bw > 0 else 0
-            if solidity < 0.45:
+            min_big_diam = self.max_diameter_pixels * 0.09
+            if not (solidity >= 0.5 or (solidity >= 0.45 and diameter >= min_big_diam)):
                 continue
 
             # 计算中心点和半径
@@ -658,18 +776,159 @@ class CircleDetectionWorker(QThread):
 
         return img_copy
 
+    def remove_black_border(self, img):
+        """
+        去除扫描黑边/阴影：检测靠近纸边、明显比页面底色暗的大块连通域
+        (深色长条、灰色阴影三角等)，用页面底色填充。
+        只处理“靠近边缘且足够大”的暗块，不动正文与远处内容。返回 (结果Image, 被填充像素数)。
+        """
+        try:
+            import cv2
+        except ImportError:
+            return img, 0
+
+        arr = np.array(img)
+        H, W = arr.shape[:2]
+        rgb = arr.ndim == 3
+        gray = (arr.mean(axis=2).astype(np.uint8) if rgb else arr.copy())
+
+        # 页面底色亮度(取偏亮的 75 分位，避免被暗块/文字拉低)
+        page_bg = float(np.percentile(gray, 75))
+        thr = page_bg - 60           # 比底色暗 60 以上视为边/阴影
+        darkish = (gray < thr).astype(np.uint8)
+
+        # 填充用底色(取接近底色亮度的像素中位 RGB)
+        bgmask = gray >= (page_bg - 20)
+        if rgb:
+            bgpx = arr[bgmask]
+            bg = tuple(int(v) for v in np.median(bgpx.reshape(-1, 3), axis=0)) if len(bgpx) else (255, 255, 255)
+        else:
+            bg = int(np.median(arr[bgmask])) if bgmask.any() else 255
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(darkish, 8)
+
+        # 局部纹理(15x15 窗标准差)：二维码/条码等高频内容纹理高，真实黑边/阴影平滑(低)
+        gf = gray.astype(np.float32)
+        gmean = cv2.blur(gf, (15, 15))
+        gsq = cv2.blur(gf * gf, (15, 15))
+        local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
+
+        min_area = int(0.0015 * W * H)  # 只处理大块，避免误删靠边文字(文字纹理高会被上面跳过)
+        fill = np.zeros((H, W), dtype=bool)
+        for i in range(1, n):
+            a = stats[i, cv2.CC_STAT_AREA]
+            if a < min_area:
+                continue
+            l = stats[i, cv2.CC_STAT_LEFT]; t = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]
+            r = l + w; b = t + h
+            # 靠近某条纸边(各自按该方向尺寸的10%)
+            if not ((l < 0.1 * W) or (r > 0.9 * W) or (t < 0.1 * H) or (b > 0.9 * H)):
+                continue
+            # 面积过大(>12%)的不是边框，是大面积内容/底色
+            if a > 0.12 * W * H:
+                continue
+            # 深度检查：至少有一条边，组件向内延伸不超过该方向30%
+            # (否则是大面积浅灰底/内容区，不是边框/阴影)
+            depth_ok = ((l < 0.1 * W and r < 0.3 * W) or
+                        (r > 0.9 * W and (W - l) < 0.3 * W) or
+                        (t < 0.1 * H and b < 0.3 * H) or
+                        (b > 0.9 * H and (H - t) < 0.3 * H))
+            if not depth_ok:
+                continue
+            comp = labels == i
+            # 纹理检查：横贯全幅(>75%宽)的顶部/底部条，或纵贯全幅(>75%高)的左/右条，
+            # 不论纹理都去除(它们是整幅黑条，纹理来自边缘过渡而非文字)。
+            # 其余局部暗块：实心黑(均值<60)直接去；灰色阴影若>10%含高纹理(文字)则跳过
+            spans_full = (w > 0.75 * W and (t < 0.1 * H or b > 0.9 * H)) or \
+                         (h > 0.75 * H and (l < 0.1 * W or r > 0.9 * W))
+            if not spans_full:
+                comp_mean_gray = float(gray[comp].mean())
+                if comp_mean_gray >= 60 and (local_std[comp] > 50).mean() > 0.10:
+                    continue
+            fill |= comp
+
+        # ---- 额外：边缘细长扫描线(细灰线) —— 仅当其周边无文字时填充 ----
+        for i in range(1, n):
+            a = stats[i, cv2.CC_STAT_AREA]
+            if a < 40:
+                continue
+            l = stats[i, cv2.CC_STAT_LEFT]; t = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]; h = stats[i, cv2.CC_STAT_HEIGHT]
+            r = l + w; b = t + h
+            # 靠近某条纸边(6%内)
+            if not ((l < 0.06 * W) or (r > 0.94 * W) or (t < 0.06 * H) or (b > 0.94 * H)):
+                continue
+            longe = max(w, h); short = min(w, h)
+            if longe < 40 or short > 25 or longe / max(short, 1) < 4:
+                continue  # 不是细长线
+            # 检查"内侧"(朝图像中心一侧)邻域是否有文字：暗像素占比>10%视为有文字
+            gap = 15
+            vertical = h > w
+            if vertical:
+                y0, y1 = max(0, t - gap), min(H, b + gap)
+                band = darkish[y0:y1, max(0, l - gap):l] if r > 0.94 * W else darkish[y0:y1, r:min(W, r + gap)]
+            else:
+                x0, x1 = max(0, l - gap), min(W, r + gap)
+                band = darkish[max(0, t - gap):t, x0:x1] if b > 0.94 * H else darkish[b:min(H, b + gap), x0:x1]
+            if band.size == 0 or band.mean() > 0.10:
+                continue  # 内侧有文字，不处理
+            fill |= (labels == i)
+
+        if not fill.any():
+            return img, 0
+        out_arr = arr.copy()
+        out_arr[fill] = bg
+        return Image.fromarray(out_arr), int(fill.sum())
+
 
 class BlackCircleRemoverPage(QWidget):
     """黑色圆圈移除主页面"""
 
+    DARK_QSS = """
+    QWidget { background-color: #0B0F19; color: #E0E0E0; font-family: 'Microsoft YaHei', Arial; }
+    QGroupBox {
+        border: 1px solid #30363D; border-radius: 5px; margin-top: 15px; padding: 15px;
+        font-weight: bold; color: #00F0FF;
+    }
+    QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+    QLineEdit, QSpinBox, QComboBox {
+        background-color: #0D1117; border: 1px solid #30363D; border-radius: 3px;
+        padding: 5px; color: #E0E0E0;
+    }
+    QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #00F0FF; }
+    QSpinBox::up-button, QSpinBox::down-button { background-color: #21262D; border: none; width: 18px; }
+    QSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #30363D; }
+    QSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #30363D; border-top: 1px solid #30363D; }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #30363D; }
+    QSpinBox::up-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-bottom: 5px solid #E0E0E0; width: 0px; height: 0px; }
+    QSpinBox::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #E0E0E0; width: 0px; height: 0px; }
+    QPushButton#ActionBtn { background-color: #238636; color: white; border: none; padding: 8px 16px; border-radius: 3px; font-weight: bold; }
+    QPushButton#ActionBtn:hover { background-color: #2EA043; }
+    QPushButton#ActionBtn:disabled { background-color: #1a3a25; color: #5a7a65; }
+    QPushButton#BrowseBtn { background-color: #30363D; color: white; border: none; padding: 5px 10px; border-radius: 3px; }
+    QPushButton#BrowseBtn:hover { background-color: #3C434D; }
+    QTextEdit { background-color: #0D1117; border: 1px solid #30363D; border-radius: 3px; color: #FFFFFF; font-size: 13px; }
+    QProgressBar { background-color: #0D1117; border: 1px solid #30363D; border-radius: 3px; text-align: center; color: #FFFFFF; font-weight: bold; }
+    QProgressBar::chunk { background-color: #2EA043; border-radius: 2px; }
+    QCheckBox { color: #E0E0E0; }
+    QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #30363D; border-radius: 3px; background-color: #0D1117; }
+    QCheckBox::indicator:checked { background-color: #00F0FF; border: 1px solid #00F0FF; }
+    """
+
     def __init__(self):
         super().__init__()
+        self.setStyleSheet(self.DARK_QSS)
         self.layout = QVBoxLayout(self)
-        self.layout.setAlignment(Qt.AlignTop)
+        self.layout.setContentsMargins(15, 10, 15, 12)
+        self.layout.setSpacing(8)
 
         # 标题
-        lbl_title = QLabel("黑色圆圈检测与裁剪工具")
-        lbl_title.setStyleSheet("color: #00F0FF; font-size: 20px; font-weight: bold; margin-bottom: 10px;")
+        lbl_title = QLabel("图像质检工具")
+        lbl_title.setAlignment(Qt.AlignCenter)
+        lbl_title.setStyleSheet(
+            "color: #00F0FF; font-size: 26px; font-weight: bold;"
+            "font-family: 'SimHei','黑体','Microsoft YaHei'; padding: 2px 0 6px 0;")
         self.layout.addWidget(lbl_title)
 
         # 设置组
@@ -709,6 +968,23 @@ class BlackCircleRemoverPage(QWidget):
         self.max_diameter_spin.setSuffix(" mm")
         form.addRow("圆圈最大直径:", self.max_diameter_spin)
 
+        # 纠偏(去倾斜)选项
+        self.deskew_check = QCheckBox("纠偏（将内容旋转到水平，纯旋转不变形）")
+        self.deskew_check.setChecked(True)
+        form.addRow("纠偏:", self.deskew_check)
+
+        # 去黑边选项(默认选中)
+        self.border_check = QCheckBox("去黑边（去除扫描产生的边缘黑条/阴影，保留正文）")
+        self.border_check.setChecked(True)
+        form.addRow("去黑边:", self.border_check)
+
+        # 线程数设置
+        self.thread_spin = QSpinBox()
+        self.thread_spin.setRange(1, 8)
+        self.thread_spin.setValue(4)
+        self.thread_spin.setSuffix(" 线程")
+        form.addRow("并行线程数:", self.thread_spin)
+
         group.setLayout(form)
         self.layout.addWidget(group)
 
@@ -720,22 +996,17 @@ class BlackCircleRemoverPage(QWidget):
             "• 仅在文字/竖线外侧区域检测黑色圆圈\n"
             "• 如无文字和竖线，则全图检测\n"
             "• 圆圈最大直径可配置（默认25mm/2.5cm）\n"
-            "• 使用白色填充方式裁剪掉检测到的圆圈\n"
-            "• 支持预览处理前后的对比效果\n"
-            "• 自动生成详细的处理日志"
+            "• 用与底色一致的颜色填充检测到的圆洞\n"
+            "• 纠偏(去倾斜)：勾选后处理前自动旋转内容到水平，纯旋转不变形\n"
+            "• 去黑边：勾选后去除扫描产生的边缘黑条/阴影（长条/三角/不规则），保留正文\n"
+            "• 纠偏、去黑边默认开启；都只处理靠近纸边的大块暗区，不动正文文字\n"
+            "• 自动生成详细的处理日志（去孔/纠偏/路径/结果）"
         )
-        info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
+        info_label.setStyleSheet("color: #8B949E; font-size: 16px;")
         self.layout.addWidget(info_label)
 
         # 按钮区域
         btn_layout = QHBoxLayout()
-
-        self.preview_btn = QPushButton("预览效果")
-        self.preview_btn.setObjectName("ActionBtn")
-        self.preview_btn.setStyleSheet("background-color: #2196F3;")
-        self.preview_btn.clicked.connect(self.show_preview)
-        self.preview_btn.setEnabled(False)
-        btn_layout.addWidget(self.preview_btn)
 
         self.process_btn = QPushButton("开始处理")
         self.process_btn.setObjectName("ActionBtn")
@@ -744,7 +1015,7 @@ class BlackCircleRemoverPage(QWidget):
 
         self.stop_btn = QPushButton("停止处理")
         self.stop_btn.setObjectName("ActionBtn")
-        self.stop_btn.setStyleSheet("background-color: #DA3633;")
+        self.stop_btn.setStyleSheet("background-color: #DA3633; color: white;")
         self.stop_btn.clicked.connect(self.stop_processing)
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
@@ -756,36 +1027,12 @@ class BlackCircleRemoverPage(QWidget):
         self.progress_bar.setFormat("待开始")
         self.layout.addWidget(self.progress_bar)
 
-        # 预览区域（分割视图）
-        preview_group = QGroupBox("预览对比（左：原图 / 右：处理后）")
-        preview_layout = QHBoxLayout()
-
-        # 原图预览
-        self.before_scroll = QScrollArea()
-        self.before_scroll.setWidgetResizable(True)
-        self.before_label = QLabel("暂无预览")
-        self.before_label.setAlignment(Qt.AlignCenter)
-        self.before_label.setStyleSheet("color: #8B949E;")
-        self.before_scroll.setWidget(self.before_label)
-
-        # 处理后预览
-        self.after_scroll = QScrollArea()
-        self.after_scroll.setWidgetResizable(True)
-        self.after_label = QLabel("暂无预览")
-        self.after_label.setAlignment(Qt.AlignCenter)
-        self.after_label.setStyleSheet("color: #8B949E;")
-        self.after_scroll.setWidget(self.after_label)
-
-        preview_layout.addWidget(self.before_scroll)
-        preview_layout.addWidget(self.after_scroll)
-        preview_group.setLayout(preview_layout)
-        self.layout.addWidget(preview_group)
-
         # 日志框
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(150)
-        self.layout.addWidget(self.log_box)
+        self.log_box.setMinimumHeight(260)
+        # 用 stretch 让结果框自动撑满下方剩余空间
+        self.layout.addWidget(self.log_box, 1)
 
         # 存储处理结果
         self.process_results = []
@@ -815,117 +1062,6 @@ class BlackCircleRemoverPage(QWidget):
             output_path = os.path.join(self.input_dir.text(), "图像处理结果")
             self.output_dir.setText(output_path)
 
-    def show_preview(self):
-        """显示预览效果"""
-        if not self.process_results:
-            QMessageBox.warning(self, "提示", "请先处理文件以生成预览")
-            return
-
-        # 找到第一个成功处理的文件进行预览
-        preview_result = None
-        for result in self.process_results:
-            if result['success'] and result['circles_found'] > 0:
-                preview_result = result
-                break
-
-        if not preview_result:
-            QMessageBox.information(self, "提示", "未找到包含黑色圆圈的文件进行预览")
-            return
-
-        # 加载并显示原图
-        try:
-            before_pixmap = self.load_image_to_pixmap(preview_result['preview_before'])
-            self.before_label.setPixmap(before_pixmap)
-            self.before_label.setText("")
-            self.log(f"✓ 已加载原图: {os.path.basename(preview_result['preview_before'])}")
-        except Exception as e:
-            error_msg = f"加载原图失败: {str(e)}"
-            self.before_label.setText(error_msg)
-            self.log(f"✗ {error_msg}")
-            import traceback
-            self.log(traceback.format_exc())
-            return
-
-        # 加载并显示处理后的图
-        try:
-            after_pixmap = self.load_image_to_pixmap(preview_result['preview_after'])
-            self.after_label.setPixmap(after_pixmap)
-            self.after_label.setText("")
-            self.log(f"✓ 已加载处理后图片: {os.path.basename(preview_result['preview_after'])}")
-        except Exception as e:
-            error_msg = f"加载处理后图片失败: {str(e)}"
-            self.after_label.setText(error_msg)
-            self.log(f"✗ {error_msg}")
-            import traceback
-            self.log(traceback.format_exc())
-            return
-
-        self.log(f"✓ 预览显示成功: {preview_result['filename']} (检测到{preview_result['circles_found']}个圆圈)")
-
-    def load_image_to_pixmap(self, image_path):
-        """加载图像并转换为QPixmap，保持适当大小"""
-        try:
-            # 直接使用Qt的QPixmap加载，更可靠
-            pixmap = QPixmap(image_path)
-            
-            if pixmap.isNull():
-                raise ValueError(f"无法加载图片: {image_path}")
-            
-            # 限制显示尺寸
-            max_display_width = 600
-            max_display_height = 400
-            
-            # 缩放图片以适应显示区域
-            scaled_pixmap = pixmap.scaled(
-                max_display_width, max_display_height,
-                Qt.KeepAspectRatio,  # 保持宽高比
-                Qt.SmoothTransformation  # 平滑缩放
-            )
-            
-            if scaled_pixmap.isNull():
-                raise ValueError(f"缩放图片失败: {image_path}")
-            
-            return scaled_pixmap
-            
-        except Exception as e:
-            # 如果直接加载失败，尝试使用PIL方法
-            img = Image.open(image_path)
-            
-            # 限制显示尺寸
-            max_display_width = 600
-            max_display_height = 400
-            
-            # 计算缩放比例
-            ratio_w = max_display_width / img.width
-            ratio_h = max_display_height / img.height
-            ratio = min(ratio_w, ratio_h, 1.0)  # 不放大
-            
-            new_width = int(img.width * ratio)
-            new_height = int(img.height * ratio)
-            
-            img_resized = img.resize((new_width, new_height), Image.LANCZOS)
-            
-            # 转换为RGB模式确保兼容性
-            if img_resized.mode != 'RGB':
-                img_resized = img_resized.convert('RGB')
-            
-            # 获取图像数据
-            data = img_resized.tobytes("raw", "RGB")
-            
-            # 创建QImage
-            qimage = QImage(data, new_width, new_height, QImage.Format_RGB888)
-            
-            if qimage.isNull():
-                raise ValueError(f"无法创建QImage: {image_path}")
-            
-            # 转换为QPixmap
-            pixmap = QPixmap.fromImage(qimage)
-            
-            if pixmap.isNull():
-                raise ValueError(f"无法创建QPixmap: {image_path}")
-            
-            return pixmap
-
     def start_processing(self):
         """开始处理"""
         input_dir = self.input_dir.text().strip()
@@ -953,20 +1089,25 @@ class BlackCircleRemoverPage(QWidget):
         # 清空之前的结果
         self.process_results = []
         self.log_box.clear()
-        self.before_label.setText("暂无预览")
-        self.after_label.setText("暂无预览")
 
         max_diameter = self.max_diameter_spin.value()
+        deskew = self.deskew_check.isChecked()
+        remove_border = self.border_check.isChecked()
 
         self.log("=" * 60)
         self.log(f"开始处理目录: {input_dir}")
         self.log(f"输出目录: {output_dir}")
         self.log(f"圆圈最大直径: {max_diameter}mm")
-        self.log(f"检测模式: 智能边界检测（根据文字和竖线自动确定）")
+        self.log(f"纠偏: {'开启（自动检测，纯旋转不变形）' if deskew else '关闭'}")
+        self.log(f"去黑边: {'开启' if remove_border else '关闭'}")
+        thread_count = self.thread_spin.value()
+        self.log(f"并行线程: {thread_count}")
         self.log("=" * 60)
 
         # 创建工作线程
-        self.worker = CircleDetectionWorker(input_dir, output_dir, max_diameter)
+        self.worker = CircleDetectionWorker(input_dir, output_dir, max_diameter,
+                                            deskew=deskew, remove_border=remove_border,
+                                            thread_count=thread_count)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.result_signal.connect(self.display_results)
@@ -977,7 +1118,6 @@ class BlackCircleRemoverPage(QWidget):
         # 更新按钮状态
         self.process_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.preview_btn.setEnabled(False)
 
     def stop_processing(self):
         """停止处理"""
@@ -1008,10 +1148,6 @@ class BlackCircleRemoverPage(QWidget):
         self.log(f"  成功处理: {success_count}")
         self.log(f"  失败: {len(results) - success_count}")
         self.log(f"  检测到的圆圈总数: {circles_total}")
-
-        # 启用预览按钮
-        if any(r['success'] and r['circles_found'] > 0 for r in results):
-            self.preview_btn.setEnabled(True)
 
     def on_finished(self, success, message):
         """处理完成回调"""
@@ -1047,7 +1183,7 @@ if __name__ == "__main__":
         pass
     
     window = BlackCircleRemoverPage()
-    window.setWindowTitle("黑色圆圈检测与裁剪工具")
+    window.setWindowTitle("同美图像质检工具")
     window.setGeometry(100, 100, 1400, 900)
     window.show()
     window.raise_()  # 确保窗口显示在最前面
