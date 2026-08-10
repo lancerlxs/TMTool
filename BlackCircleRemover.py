@@ -18,9 +18,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QTextEdit, QSpinBox,
                              QFormLayout, QGroupBox, QMessageBox, QCheckBox,
-                             QProgressBar)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal
-from PyQt5.QtGui import QFont
+                             QProgressBar, QGraphicsView, QGraphicsScene,
+                             QScrollArea, QDoubleSpinBox, QSplitter, QSizePolicy,
+                             QFrame, QTabWidget, QTreeWidget, QTreeWidgetItem)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QRectF, QSize
+from PyQt5.QtGui import QFont, QImage, QPixmap, QPainter, QPen, QColor, QWheelEvent
 
 
 def _projection_skew(pil_img, max_angle=8.0):
@@ -144,21 +146,24 @@ class CircleDetectionWorker(QThread):
     progress_signal = Signal(int, int)
     result_signal = Signal(list)  # 发送处理结果列表
     finished_signal = Signal(bool, str)
+    file_done_signal = Signal(str)  # 单个文件处理完成后发射其输出路径
 
-    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, deskew=False, remove_border=True, thread_count=4, parent=None):
+    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, deskew=False, remove_border=True, thread_count=4, edge_cover=False, edge_margin_mm=2.0, dpi=300, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_dir = output_dir
-        self.max_diameter_mm = max_diameter_mm  # 最大直径（毫米），默认25mm(2.5cm)
-        self.margin_mm = margin_mm  # 两侧边距（毫米），默认40mm(4cm)
-        self.deskew = deskew  # 是否在处理前对图像纠偏(去倾斜)
-        self.remove_border = remove_border  # 是否去除扫描黑边/阴影
-        self.thread_count = thread_count  # 并发线程数
+        self.max_diameter_mm = max_diameter_mm
+        self.margin_mm = margin_mm
+        self.deskew = deskew
+        self.remove_border = remove_border
+        self.thread_count = thread_count
+        self.edge_cover = edge_cover
+        self.edge_margin_mm = edge_margin_mm
         self.is_stopped = False
-        # 假设300 DPI进行像素转换
-        self.dpi_assumption = 300
+        self.dpi_assumption = dpi
         self.max_diameter_pixels = int(self.max_diameter_mm * self.dpi_assumption / 25.4)
-        self.margin_pixels = int(self.margin_mm * self.dpi_assumption / 25.4)  # 边距像素值
+        self.margin_pixels = int(self.margin_mm * self.dpi_assumption / 25.4)
+        self.edge_margin_pixels = int(self.edge_margin_mm * self.dpi_assumption / 25.4) if self.edge_cover else 0
 
     def run(self):
         try:
@@ -244,6 +249,8 @@ class CircleDetectionWorker(QThread):
                         wlog(f"  纠偏: {'已纠正 %.2f°' % da if da else '无明显偏斜，未纠偏'}")
                     wlog(f"  结果: {'成功' if result['success'] else '失败: ' + str(result.get('error_msg', ''))}")
                     wlog(f"  输出: {result.get('output_path', '')}")
+                    if result['success'] and result.get('output_path'):
+                        self.file_done_signal.emit(result['output_path'])
                     self.progress_signal.emit(processed[0], total)
 
             with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
@@ -320,6 +327,10 @@ class CircleDetectionWorker(QThread):
             # --- 再去黑边/阴影（孔已填充为底色，不会被误连）---
             if self.remove_border:
                 img, _br = self.remove_black_border(img)
+
+            # --- 边缘底色覆盖：将四周边缘区域用底色覆盖 ---
+            if self.edge_cover and self.edge_margin_pixels > 0:
+                img = self.cover_edge_with_bg(img, self.edge_margin_pixels)
 
             # 输出路径（保持原目录结构），确保每个文件都写入目标目录
             rel_path = os.path.relpath(image_path, self.input_dir)
@@ -640,7 +651,7 @@ class CircleDetectionWorker(QThread):
             bw, bh = max_col - min_col, max_row - min_row
             solidity = pixel_count / (bh * bw) if bh * bw > 0 else 0
             min_big_diam = self.max_diameter_pixels * 0.09
-            if not (solidity >= 0.5 or (solidity >= 0.45 and diameter >= min_big_diam)):
+            if not (solidity >= 0.5 or (solidity >= 0.40 and diameter >= min_big_diam)):
                 continue
 
             # 计算中心点和半径
@@ -881,6 +892,226 @@ class CircleDetectionWorker(QThread):
         out_arr[fill] = bg
         return Image.fromarray(out_arr), int(fill.sum())
 
+    def cover_edge_with_bg(self, img, margin_px):
+        """
+        将图像四周边缘 margin_px 像素宽度的区域用底色覆盖。
+        底色通过采样四角区域的中位数获得。
+        """
+        arr = np.array(img)
+        H, W = arr.shape[:2]
+        rgb = arr.ndim == 3
+
+        # 采样四角区域获取底色
+        corner = max(10, margin_px // 2)
+        corners = [
+            arr[0:corner, 0:corner],
+            arr[0:corner, W - corner:W],
+            arr[H - corner:H, 0:corner],
+            arr[H - corner:H, W - corner:W],
+        ]
+        samples = np.concatenate([c.reshape(-1, c.shape[-1]) if rgb else c.reshape(-1) for c in corners])
+        if rgb:
+            bright = samples[samples.mean(axis=1) > 80]
+            bg_color = tuple(int(v) for v in np.median(bright, axis=0)) if len(bright) else (255, 255, 255)
+        else:
+            bright = samples[samples > 80]
+            bg_color = int(np.median(bright)) if bright.size else 255
+
+        out = arr.copy()
+        # 上边
+        out[:margin_px, :] = bg_color
+        # 下边
+        out[H - margin_px:, :] = bg_color
+        # 左边（排除已处理的上下角）
+        out[margin_px:H - margin_px, :margin_px] = bg_color
+        # 右边
+        out[margin_px:H - margin_px, W - margin_px:] = bg_color
+
+        return Image.fromarray(out)
+
+
+class ZoomableImageView(QGraphicsView):
+    """支持缩放和边距红框叠加的图像预览视图"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item = None
+        self._margin_rect_item = None
+        self._scale_factor = 1.0
+        self.setRenderHint(QPainter.SmoothPixmapTransform)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setStyleSheet("background-color: #1a1a2e; border: 1px solid #30363D; border-radius: 3px;")
+        self._img_width = 0
+        self._img_height = 0
+
+    def set_image(self, pil_image, margin_mm=0, dpi=300):
+        """设置显示的PIL图像，可选绘制边距红框"""
+        if pil_image is None:
+            return
+        rgb = pil_image.convert('RGB')
+        data = rgb.tobytes('raw', 'RGB')
+        qimg = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        self._img_width = rgb.width
+        self._img_height = rgb.height
+
+        self._scene.clear()
+        self._scene.setSceneRect(0, 0, pixmap.width(), pixmap.height())
+        self._pixmap_item = self._scene.addPixmap(pixmap)
+
+        if margin_mm > 0:
+            px = int(margin_mm * dpi / 25.4)
+            pen = QPen(QColor(255, 0, 0), max(2, int(max(rgb.width, rgb.height) / 500)))
+            self._margin_rect_item = self._scene.addRect(
+                QRectF(px, px, max(0, rgb.width - 2 * px), max(0, rgb.height - 2 * px)), pen)
+        else:
+            self._margin_rect_item = None
+
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+        self._scale_factor = 1.0
+
+    def clear_image(self):
+        self._scene.clear()
+        self._pixmap_item = None
+        self._margin_rect_item = None
+        self._img_width = 0
+        self._img_height = 0
+
+    def zoom_in(self):
+        self._scale_factor *= 1.25
+        self.scale(1.25, 1.25)
+
+    def zoom_out(self):
+        self._scale_factor /= 1.25
+        self.scale(1 / 1.25, 1 / 1.25)
+
+    def fit_to_view(self):
+        if self._pixmap_item:
+            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+            self._scale_factor = 1.0
+
+    def wheelEvent(self, event: QWheelEvent):
+        if event.angleDelta().y() > 0:
+            self.zoom_in()
+        else:
+            self.zoom_out()
+
+
+class PreviewPanel(QWidget):
+    """单个预览面板：包含导航、缩放、图像视图和路径显示"""
+    nav_changed = Signal()  # 当用户切换页面时发出
+
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # 标题栏
+        header = QLabel(title)
+        header.setAlignment(Qt.AlignCenter)
+        header.setStyleSheet("color: #00F0FF; font-size: 14px; font-weight: bold; padding: 2px;")
+        layout.addWidget(header)
+
+        # 导航栏
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("◀ 上一页")
+        self.prev_btn.setObjectName("BrowseBtn")
+        self.prev_btn.setFixedWidth(90)
+        self.next_btn = QPushButton("下一页 ▶")
+        self.next_btn.setObjectName("BrowseBtn")
+        self.next_btn.setFixedWidth(90)
+        self.page_label = QLabel("0 / 0")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setStyleSheet("color: #E0E0E0; font-size: 12px;")
+        nav.addWidget(self.prev_btn)
+        nav.addWidget(self.page_label, 1)
+        nav.addWidget(self.next_btn)
+        layout.addLayout(nav)
+
+        # 图像视图
+        self.image_view = ZoomableImageView()
+        self.image_view.setMinimumHeight(300)
+        layout.addWidget(self.image_view, 1)
+
+        # 缩放按钮栏
+        zoom_bar = QHBoxLayout()
+        self.zoom_in_btn = QPushButton("放大 +")
+        self.zoom_in_btn.setObjectName("BrowseBtn")
+        self.zoom_in_btn.setFixedWidth(70)
+        self.zoom_out_btn = QPushButton("缩小 −")
+        self.zoom_out_btn.setObjectName("BrowseBtn")
+        self.zoom_out_btn.setFixedWidth(70)
+        self.fit_btn = QPushButton("适应窗口")
+        self.fit_btn.setObjectName("BrowseBtn")
+        self.fit_btn.setFixedWidth(80)
+        zoom_bar.addWidget(self.zoom_in_btn)
+        zoom_bar.addWidget(self.zoom_out_btn)
+        zoom_bar.addWidget(self.fit_btn)
+        zoom_bar.addStretch()
+        layout.addLayout(zoom_bar)
+
+        # 文件路径
+        self.path_label = QLabel("")
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet("color: #8B949E; font-size: 14px; padding: 3px;")
+        layout.addWidget(self.path_label)
+
+        # 连接缩放按钮
+        self.zoom_in_btn.clicked.connect(self.image_view.zoom_in)
+        self.zoom_out_btn.clicked.connect(self.image_view.zoom_out)
+        self.fit_btn.clicked.connect(self.image_view.fit_to_view)
+
+        self._files = []
+        self._current_index = -1
+
+    def set_files(self, files):
+        self._files = list(files)
+        self._current_index = 0 if files else -1
+        self._update_nav_state()
+
+    def get_current_index(self):
+        return self._current_index
+
+    def set_current_index(self, idx):
+        if 0 <= idx < len(self._files):
+            self._current_index = idx
+            self._update_nav_state()
+            self.nav_changed.emit()
+
+    def current_file(self):
+        if 0 <= self._current_index < len(self._files):
+            return self._files[self._current_index]
+        return None
+
+    def file_count(self):
+        return len(self._files)
+
+    def _update_nav_state(self):
+        total = len(self._files)
+        self.prev_btn.setEnabled(self._current_index > 0)
+        self.next_btn.setEnabled(self._current_index < total - 1)
+        if total > 0:
+            self.page_label.setText(f"{self._current_index + 1} / {total}")
+        else:
+            self.page_label.setText("0 / 0")
+
+    def show_pil_image(self, pil_image, margin_mm=0, dpi=300):
+        self.image_view.set_image(pil_image, margin_mm, dpi)
+        f = self.current_file()
+        self.path_label.setText(f if f else "")
+
+    def clear(self):
+        self.image_view.clear_image()
+        self.path_label.setText("")
+        self.page_label.setText("0 / 0")
+        self._files = []
+        self._current_index = -1
+
 
 class BlackCircleRemoverPage(QWidget):
     """黑色圆圈移除主页面"""
@@ -923,13 +1154,19 @@ class BlackCircleRemoverPage(QWidget):
         self.layout.setContentsMargins(15, 10, 15, 12)
         self.layout.setSpacing(8)
 
+        # === 左侧面板：设置区 ===
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
         # 标题
         lbl_title = QLabel("图像质检工具")
         lbl_title.setAlignment(Qt.AlignCenter)
         lbl_title.setStyleSheet(
             "color: #00F0FF; font-size: 26px; font-weight: bold;"
             "font-family: 'SimHei','黑体','Microsoft YaHei'; padding: 2px 0 6px 0;")
-        self.layout.addWidget(lbl_title)
+        left_layout.addWidget(lbl_title)
 
         # 设置组
         group = QGroupBox("处理设置")
@@ -978,6 +1215,32 @@ class BlackCircleRemoverPage(QWidget):
         self.border_check.setChecked(True)
         form.addRow("去黑边:", self.border_check)
 
+        # DPI 设置
+        self.dpi_spin = QSpinBox()
+        self.dpi_spin.setRange(72, 1200)
+        self.dpi_spin.setValue(300)
+        self.dpi_spin.setSuffix(" DPI")
+        self.dpi_spin.setToolTip("用于将毫米转换为像素的DPI假设值")
+        form.addRow("图像DPI:", self.dpi_spin)
+
+        # 边缘覆盖边距设置
+        self.edge_margin_spin = QDoubleSpinBox()
+        self.edge_margin_spin.setRange(0.0, 50.0)
+        self.edge_margin_spin.setValue(2.0)
+        self.edge_margin_spin.setSingleStep(0.5)
+        self.edge_margin_spin.setSuffix(" mm")
+        self.edge_margin_spin.setToolTip("距离文件边缘的边距宽度，该区域内的内容将被底色覆盖")
+        form.addRow("边缘覆盖边距:", self.edge_margin_spin)
+
+        # 边缘覆盖选项
+        self.edge_cover_check = QCheckBox("边缘底色覆盖（将四周边缘区域用底色覆盖）")
+        self.edge_cover_check.setChecked(False)
+        self.edge_cover_check.setToolTip("启用后，处理时会将文件四周边缘设定边距宽度的区域用底色覆盖")
+        # 勾选/改值时实时刷新预览红框
+        self.edge_cover_check.stateChanged.connect(self._refresh_edge_preview)
+        self.edge_margin_spin.valueChanged.connect(self._refresh_edge_preview)
+        form.addRow("边缘覆盖:", self.edge_cover_check)
+
         # 线程数设置
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 8)
@@ -986,7 +1249,7 @@ class BlackCircleRemoverPage(QWidget):
         form.addRow("并行线程数:", self.thread_spin)
 
         group.setLayout(form)
-        self.layout.addWidget(group)
+        left_layout.addWidget(group)
 
         # 说明文本
         info_label = QLabel(
@@ -994,16 +1257,14 @@ class BlackCircleRemoverPage(QWidget):
             "• 递归扫描指定目录及子目录下的所有JPG文件\n"
             "• 智能检测文字和竖线边界，自动确定检测区域\n"
             "• 仅在文字/竖线外侧区域检测黑色圆圈\n"
-            "• 如无文字和竖线，则全图检测\n"
             "• 圆圈最大直径可配置（默认25mm/2.5cm）\n"
             "• 用与底色一致的颜色填充检测到的圆洞\n"
-            "• 纠偏(去倾斜)：勾选后处理前自动旋转内容到水平，纯旋转不变形\n"
-            "• 去黑边：勾选后去除扫描产生的边缘黑条/阴影（长条/三角/不规则），保留正文\n"
-            "• 纠偏、去黑边默认开启；都只处理靠近纸边的大块暗区，不动正文文字\n"
-            "• 自动生成详细的处理日志（去孔/纠偏/路径/结果）"
+            "• 边缘覆盖：将文件四周边缘用底色覆盖\n"
+            "• 右侧预览区可预览原图和处理后的效果\n"
+            "• 支持鼠标滚轮缩放、拖拽查看"
         )
-        info_label.setStyleSheet("color: #8B949E; font-size: 16px;")
-        self.layout.addWidget(info_label)
+        info_label.setStyleSheet("color: #8B949E; font-size: 14px;")
+        left_layout.addWidget(info_label)
 
         # 按钮区域
         btn_layout = QHBoxLayout()
@@ -1020,33 +1281,78 @@ class BlackCircleRemoverPage(QWidget):
         self.stop_btn.setEnabled(False)
         btn_layout.addWidget(self.stop_btn)
 
-        self.layout.addLayout(btn_layout)
+        left_layout.addLayout(btn_layout)
 
         # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setFormat("待开始")
-        self.layout.addWidget(self.progress_bar)
+        left_layout.addWidget(self.progress_bar)
 
         # 日志框
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(260)
-        # 用 stretch 让结果框自动撑满下方剩余空间
-        self.layout.addWidget(self.log_box, 1)
+        self.log_box.setMinimumHeight(180)
+        left_layout.addWidget(self.log_box, 1)
+
+        # === 右侧：预览区（原图和处理后并排显示） ===
+        self.preview_splitter = QSplitter(Qt.Vertical)
+
+        self.before_panel = PreviewPanel("原图预览")
+        self.after_panel = PreviewPanel("处理后预览")
+        self.preview_splitter.addWidget(self.before_panel)
+        self.preview_splitter.addWidget(self.after_panel)
+        self.preview_splitter.setStretchFactor(0, 1)
+        self.preview_splitter.setStretchFactor(1, 1)
+
+        # === 中间：文件树浏览器 ===
+        tree_container = QWidget()
+        tree_layout = QVBoxLayout(tree_container)
+        tree_layout.setContentsMargins(2, 2, 2, 2)
+        tree_label = QLabel("文件浏览器")
+        tree_label.setStyleSheet("color: #00F0FF; font-weight: bold; padding: 2px;")
+        tree_layout.addWidget(tree_label)
+        self.file_tree = QTreeWidget()
+        self.file_tree.setHeaderHidden(True)
+        self.file_tree.setStyleSheet("""
+            QTreeWidget { background-color: #0D1117; border: 1px solid #30363D; border-radius: 3px; font-size: 13px; color: #E0E0E0; }
+            QTreeWidget::item { padding: 3px; }
+            QTreeWidget::item:selected { background-color: #1F6FEB; color: white; }
+        """)
+        self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
+        tree_layout.addWidget(self.file_tree)
+
+        # 分割器（三栏：设置 | 文件树 | 预览）
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(left_panel)
+        self.main_splitter.addWidget(tree_container)
+        self.main_splitter.addWidget(self.preview_splitter)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 3)
+        self.main_splitter.setSizes([300, 200, 500])
+        self.layout.addWidget(self.main_splitter, 1)
 
         # 存储处理结果
         self.process_results = []
         self.worker = None
+        self.source_files = []  # 源目录下的所有JPG文件列表
+
+        # 连接预览导航按钮
+        self.before_panel.prev_btn.clicked.connect(lambda: self._tree_navigate(-1))
+        self.before_panel.next_btn.clicked.connect(lambda: self._tree_navigate(1))
+        self.after_panel.prev_btn.clicked.connect(lambda: self._navigate_preview(self.after_panel, -1))
+        self.after_panel.next_btn.clicked.connect(lambda: self._navigate_preview(self.after_panel, 1))
 
     def browse_input_dir(self):
         """选择输入目录"""
         d = QFileDialog.getExistingDirectory(self, "选择输入目录")
         if d:
             self.input_dir.setText(d)
-            # 如果启用了自动输出目录，更新输出目录
             if self.auto_output_dir.isChecked():
                 output_path = os.path.join(d, "图像处理结果")
                 self.output_dir.setText(output_path)
+            self._scan_source_files(d)
+            self.build_file_tree(d)
 
     def browse_output_dir(self):
         """选择输出目录"""
@@ -1061,6 +1367,126 @@ class BlackCircleRemoverPage(QWidget):
         if state == Qt.Checked and self.input_dir.text():
             output_path = os.path.join(self.input_dir.text(), "图像处理结果")
             self.output_dir.setText(output_path)
+
+    def build_file_tree(self, root_dir):
+        """构建文件浏览器树：一级=子目录(默认折叠)+根目录下的JPG文件。"""
+        self.file_tree.clear()
+        self._tree_files = []
+        self._tree_current_idx = -1
+        if not root_dir or not os.path.isdir(root_dir):
+            return
+        self._tree_root_dir = root_dir
+        try:
+            entries = sorted(os.listdir(root_dir))
+            for sub in entries:
+                sub_path = os.path.join(root_dir, sub)
+                if not os.path.isdir(sub_path):
+                    continue
+                count = 0
+                sub_files = []
+                for r, d, files in os.walk(sub_path):
+                    for f in sorted(files):
+                        if f.lower().endswith(('.jpg', '.jpeg')):
+                            sub_files.append(os.path.join(r, f))
+                            count += 1
+                if count == 0:
+                    continue
+                dir_item = QTreeWidgetItem(self.file_tree)
+                dir_item.setText(0, f"📁 {sub} ({count})")
+                dir_item.setForeground(0, QColor("#00F0FF"))
+                dir_item.setData(0, Qt.UserRole, ("dir", sub_path))
+                for fp in sub_files:
+                    file_item = QTreeWidgetItem(dir_item)
+                    file_item.setText(0, os.path.basename(fp))
+                    file_item.setData(0, Qt.UserRole, ("file", fp))
+                    self._tree_files.append(fp)
+            root_jpgs = []
+            for f in entries:
+                fp = os.path.join(root_dir, f)
+                if os.path.isfile(fp) and f.lower().endswith(('.jpg', '.jpeg')):
+                    root_jpgs.append(fp)
+            if root_jpgs:
+                root_item = QTreeWidgetItem(self.file_tree)
+                root_item.setText(0, f"📁 根目录 ({len(root_jpgs)})")
+                root_item.setForeground(0, QColor("#00F0FF"))
+                root_item.setData(0, Qt.UserRole, ("dir", root_dir))
+                for fp in root_jpgs:
+                    file_item = QTreeWidgetItem(root_item)
+                    file_item.setText(0, os.path.basename(fp))
+                    file_item.setData(0, Qt.UserRole, ("file", fp))
+                    self._tree_files.append(fp)
+        except Exception as e:
+            self.log(f"构建文件树出错: {e}")
+
+    def on_tree_item_clicked(self, item, column):
+        """点击文件树节点：文件则预览，目录则展开/折叠"""
+        data = item.data(0, Qt.UserRole)
+        if data and data[0] == "file":
+            filepath = data[1]
+            # 更新当前索引
+            if filepath in self._tree_files:
+                self._tree_current_idx = self._tree_files.index(filepath)
+                self._update_nav_buttons()
+            self.preview_file_by_path(filepath)
+
+    def preview_file_by_path(self, filepath):
+        """按文件路径预览：原图+处理后对比。
+        严格按"相对目录路径+文件名"匹配，确保不会错位。"""
+        if not filepath or not os.path.isfile(filepath):
+            return
+        # 原图（如果勾选了边缘覆盖，传入margin参数以显示红框）
+        edge_mm = self.edge_margin_spin.value() if self.edge_cover_check.isChecked() else 0
+        dpi_val = 300
+        try:
+            img = Image.open(filepath)
+            img.load()
+            self.before_panel.show_pil_image(img, margin_mm=edge_mm, dpi=dpi_val)
+            self.before_panel._filepath = filepath
+        except Exception:
+            pass
+        # 处理后结果：严格按相对路径匹配
+        self.after_panel.clear()
+        output_dir = self.output_dir.text().strip()
+        root_dir = getattr(self, '_tree_root_dir', '') or self.input_dir.text().strip()
+        if output_dir and os.path.isdir(output_dir) and root_dir:
+            # 计算输入文件相对于输入根目录的相对路径
+            rel = os.path.relpath(filepath, root_dir)
+            after_path = os.path.join(output_dir, rel)
+            if os.path.isfile(after_path):
+                try:
+                    img2 = Image.open(after_path)
+                    img2.load()
+                    self.after_panel.show_pil_image(img2)
+                    self.after_panel._filepath = after_path
+                except Exception:
+                    pass
+
+    def _tree_navigate(self, direction):
+        """通过文件树列表导航：-1上一页，+1下一页，原图和处理后联动"""
+        files = getattr(self, '_tree_files', [])
+        idx = getattr(self, '_tree_current_idx', -1)
+        new_idx = idx + direction
+        if 0 <= new_idx < len(files):
+            self._tree_current_idx = new_idx
+            self._update_nav_buttons()
+            self.preview_file_by_path(files[new_idx])
+
+    def _update_nav_buttons(self):
+        """更新原图面板的上一页/下一页按钮状态和页码"""
+        files = getattr(self, '_tree_files', [])
+        idx = getattr(self, '_tree_current_idx', -1)
+        total = len(files)
+        self.before_panel.prev_btn.setEnabled(idx > 0)
+        self.before_panel.next_btn.setEnabled(idx < total - 1)
+        if 0 <= idx < total:
+            self.before_panel.page_label.setText(f"{idx + 1} / {total}")
+
+    def _refresh_edge_preview(self):
+        """边缘覆盖勾选/改值时，实时刷新原图预览的红框"""
+        files = getattr(self, '_tree_files', [])
+        idx = getattr(self, '_tree_current_idx', -1)
+        if 0 <= idx < len(files):
+            self.preview_file_by_path(files[idx])
 
     def start_processing(self):
         """开始处理"""
@@ -1093,6 +1519,9 @@ class BlackCircleRemoverPage(QWidget):
         max_diameter = self.max_diameter_spin.value()
         deskew = self.deskew_check.isChecked()
         remove_border = self.border_check.isChecked()
+        dpi = self.dpi_spin.value()
+        edge_cover = self.edge_cover_check.isChecked()
+        edge_margin = self.edge_margin_spin.value()
 
         self.log("=" * 60)
         self.log(f"开始处理目录: {input_dir}")
@@ -1100,6 +1529,10 @@ class BlackCircleRemoverPage(QWidget):
         self.log(f"圆圈最大直径: {max_diameter}mm")
         self.log(f"纠偏: {'开启（自动检测，纯旋转不变形）' if deskew else '关闭'}")
         self.log(f"去黑边: {'开启' if remove_border else '关闭'}")
+        self.log(f"边缘覆盖: {'开启' if edge_cover else '关闭'}")
+        if edge_cover:
+            self.log(f"边缘覆盖边距: {edge_margin}mm")
+        self.log(f"DPI: {dpi}")
         thread_count = self.thread_spin.value()
         self.log(f"并行线程: {thread_count}")
         self.log("=" * 60)
@@ -1107,11 +1540,17 @@ class BlackCircleRemoverPage(QWidget):
         # 创建工作线程
         self.worker = CircleDetectionWorker(input_dir, output_dir, max_diameter,
                                             deskew=deskew, remove_border=remove_border,
-                                            thread_count=thread_count)
+                                            thread_count=thread_count,
+                                            edge_cover=edge_cover, edge_margin_mm=edge_margin,
+                                            dpi=dpi)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.result_signal.connect(self.display_results)
         self.worker.finished_signal.connect(self.on_finished)
+        self.worker.file_done_signal.connect(self._on_file_done)
+
+        # 清空处理后预览
+        self.after_panel.clear()
 
         self.worker.start()
 
@@ -1142,12 +1581,19 @@ class BlackCircleRemoverPage(QWidget):
 
         success_count = sum(1 for r in results if r['success'])
         circles_total = sum(r['circles_found'] for r in results)
-        
+
         self.log(f"\n处理统计：")
         self.log(f"  总文件数: {len(results)}")
         self.log(f"  成功处理: {success_count}")
         self.log(f"  失败: {len(results) - success_count}")
         self.log(f"  检测到的圆圈总数: {circles_total}")
+
+        # 设置处理后预览文件列表
+        processed_files = [r['output_path'] for r in results if r['success'] and r.get('output_path')]
+        if processed_files:
+            self.after_panel.set_files(processed_files)
+            self.after_panel.set_current_index(0)
+            self._show_after_preview(0)
 
     def on_finished(self, success, message):
         """处理完成回调"""
@@ -1166,6 +1612,90 @@ class BlackCircleRemoverPage(QWidget):
     def log(self, msg):
         """添加日志"""
         self.log_box.append(f">> {msg}")
+
+    # === 预览相关方法 ===
+
+    def _on_file_done(self, output_path):
+        """单个文件处理完成，实时更新处理后预览"""
+        if not os.path.exists(output_path):
+            return
+        # 添加到处理后预览文件列表
+        current_files = list(self.after_panel._files)
+        if output_path not in current_files:
+            current_files.append(output_path)
+            self.after_panel._files = current_files
+            # 如果是第一个文件，显示它
+            if len(current_files) == 1:
+                self.after_panel._current_index = 0
+                self.after_panel._update_nav_state()
+                self._show_after_preview(0)
+
+    def _scan_source_files(self, source_dir):
+        """扫描源目录下的所有JPG文件，更新预览"""
+        jpg_files = []
+        for root, dirs, files in os.walk(source_dir):
+            for filename in files:
+                if filename.lower().endswith(('.jpg', '.jpeg')):
+                    jpg_files.append(os.path.join(root, filename))
+
+        def _natural_key(path):
+            return [int(t) if t.isdigit() else t.lower()
+                    for t in re.split(r'(\d+)', path)]
+        jpg_files.sort(key=_natural_key)
+
+        self.source_files = jpg_files
+        if jpg_files:
+            self.before_panel.set_files(jpg_files)
+            self.before_panel.set_current_index(0)
+            self._show_before_preview(0)
+        else:
+            self.before_panel.clear()
+
+    def _show_before_preview(self, index):
+        """显示原图预览"""
+        if 0 <= index < len(self.source_files):
+            try:
+                img = Image.open(self.source_files[index])
+                img.load()
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                dpi = self.dpi_spin.value()
+                margin_mm = self.edge_margin_spin.value() if self.edge_cover_check.isChecked() else 0
+                self.before_panel.show_pil_image(img, margin_mm, dpi)
+            except Exception as e:
+                self.before_panel.image_view.clear_image()
+                self.before_panel.path_label.setText(f"加载失败: {e}")
+
+    def _show_after_preview(self, index):
+        """显示处理后预览"""
+        files = self.after_panel._files
+        if 0 <= index < len(files):
+            try:
+                img = Image.open(files[index])
+                img.load()
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                self.after_panel.show_pil_image(img, 0, 0)
+            except Exception as e:
+                self.after_panel.image_view.clear_image()
+                self.after_panel.path_label.setText(f"加载失败: {e}")
+
+    def _navigate_preview(self, panel, direction):
+        """导航预览：direction=-1上一页，+1下一页"""
+        current = panel.get_current_index()
+        new_idx = current + direction
+        if 0 <= new_idx < panel.file_count():
+            panel.set_current_index(new_idx)
+            if panel is self.before_panel:
+                self._show_before_preview(new_idx)
+                if new_idx < self.after_panel.file_count():
+                    self.after_panel.set_current_index(new_idx)
+                    self._show_after_preview(new_idx)
+            elif panel is self.after_panel:
+                self._show_after_preview(new_idx)
+                if new_idx < self.before_panel.file_count():
+                    self.before_panel.set_current_index(new_idx)
+                    self._show_before_preview(new_idx)
 
 
 # 测试代码
