@@ -548,13 +548,21 @@ class CircleDetectionWorker(QThread):
                 if not placed:
                     cols.append([c])
             min_iso = self.max_diameter_pixels * 0.045
+            max_per_col = 6  # 超过6个的列/排是文字(如标题行)，不是装订孔
             for col in cols:
-                if len(col) >= 2:
-                    thresh = max(floor, max(c[2] for c in col) * 0.5)
-                    for cx, cy, r in col:
-                        if r >= thresh:
-                            kept.append((cx, cy, r))
+                # 计算相对尺寸阈值：排除单个异常大值(如角落扫描伪影)的干扰
+                radii = sorted([c[2] for c in col])
+                if len(radii) >= 3 and radii[-1] > radii[-2] * 1.5:
+                    ref_r = radii[-2]  # 最大值是异常值，用第二大
                 else:
+                    ref_r = radii[-1]
+                thresh = max(floor, ref_r * 0.5)
+                filtered = [(cx, cy, r) for cx, cy, r in col if r >= thresh]
+                if len(filtered) > max_per_col:
+                    continue  # 过滤后仍太密集=文字行，跳过
+                if len(filtered) >= 2:
+                    kept.extend(filtered)
+                elif len(col) == 1:
                     cx, cy, r = col[0]
                     if r >= min_iso:
                         kept.append((cx, cy, r))
@@ -651,7 +659,7 @@ class CircleDetectionWorker(QThread):
             bw, bh = max_col - min_col, max_row - min_row
             solidity = pixel_count / (bh * bw) if bh * bw > 0 else 0
             min_big_diam = self.max_diameter_pixels * 0.09
-            if not (solidity >= 0.5 or (solidity >= 0.40 and diameter >= min_big_diam)):
+            if not (solidity >= 0.5 or (solidity >= 0.45 and diameter >= min_big_diam)):
                 continue
 
             # 计算中心点和半径
@@ -889,6 +897,12 @@ class CircleDetectionWorker(QThread):
         if not fill.any():
             return img, 0
         out_arr = arr.copy()
+        # 墨迹保护：不覆盖非常暗的像素(灰度<底色-80)，这些是手写/印章/文字笔画
+        bg_gray_val = float(np.mean(bg)) if rgb else float(bg)
+        ink_mask = gray < (bg_gray_val - 80)
+        fill = fill & ~ink_mask
+        if not fill.any():
+            return img, 0
         out_arr[fill] = bg
         return Image.fromarray(out_arr), int(fill.sum())
 
@@ -896,6 +910,7 @@ class CircleDetectionWorker(QThread):
         """
         将图像四周边缘 margin_px 像素宽度的区域用底色覆盖。
         底色通过采样四角区域的中位数获得。
+        边缘区域内含手写/文字(高纹理)的段落跳过，只覆盖纯色边框区域。
         """
         arr = np.array(img)
         H, W = arr.shape[:2]
@@ -918,14 +933,45 @@ class CircleDetectionWorker(QThread):
             bg_color = int(np.median(bright)) if bright.size else 255
 
         out = arr.copy()
+
+        # 局部纹理：边缘区域内有手写/文字的段落(高纹理)不覆盖
+        gray = arr.mean(axis=2).astype(np.float32) if rgb else arr.astype(np.float32)
+        win = max(5, margin_px // 3)
+        try:
+            import cv2
+            gmean = cv2.blur(gray, (win, win))
+            gsq = cv2.blur(gray * gray, (win, win))
+            local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
+            has_texture = local_std > 30  # 高纹理=有内容
+        except ImportError:
+            has_texture = np.zeros((H, W), dtype=bool)
+
+        # 只覆盖低纹理(纯色边框)区域，跳过高纹理(手写/文字)和深色墨迹(手写笔画)
+        bg_gray_val = float(np.mean(bg_color)) if rgb else float(bg_color)
+        def safe_cover(y0, y1, x0, x1):
+            if y0 >= y1 or x0 >= x1:
+                return
+            region_texture = has_texture[y0:y1, x0:x1]
+            region_gray = gray[y0:y1, x0:x1]
+            # 只覆盖：低纹理(非边框)且非深色墨迹的像素
+            # 深色墨迹(gray < bg-60)是手写/印章，不覆盖
+            is_ink = region_gray < (bg_gray_val - 60)
+            cover_mask = ~region_texture & ~is_ink
+            if rgb:
+                sub = out[y0:y1, x0:x1]
+                sub[cover_mask] = bg_color
+                out[y0:y1, x0:x1] = sub
+            else:
+                out[y0:y1, x0:x1][cover_mask] = bg_color
+
         # 上边
-        out[:margin_px, :] = bg_color
+        safe_cover(0, margin_px, 0, W)
         # 下边
-        out[H - margin_px:, :] = bg_color
-        # 左边（排除已处理的上下角）
-        out[margin_px:H - margin_px, :margin_px] = bg_color
+        safe_cover(H - margin_px, H, 0, W)
+        # 左边
+        safe_cover(margin_px, H - margin_px, 0, margin_px)
         # 右边
-        out[margin_px:H - margin_px, W - margin_px:] = bg_color
+        safe_cover(margin_px, H - margin_px, W - margin_px, W)
 
         return Image.fromarray(out)
 
@@ -1319,6 +1365,7 @@ class BlackCircleRemoverPage(QWidget):
             QTreeWidget::item:selected { background-color: #1F6FEB; color: white; }
         """)
         self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self.file_tree.currentItemChanged.connect(self.on_tree_current_changed)
         tree_layout.addWidget(self.file_tree)
 
         # 分割器（三栏：设置 | 文件树 | 预览）
@@ -1340,8 +1387,9 @@ class BlackCircleRemoverPage(QWidget):
         # 连接预览导航按钮
         self.before_panel.prev_btn.clicked.connect(lambda: self._tree_navigate(-1))
         self.before_panel.next_btn.clicked.connect(lambda: self._tree_navigate(1))
-        self.after_panel.prev_btn.clicked.connect(lambda: self._navigate_preview(self.after_panel, -1))
-        self.after_panel.next_btn.clicked.connect(lambda: self._navigate_preview(self.after_panel, 1))
+        # 处理结果预览取消上一页/下一页，只随动原图预览
+        self.after_panel.prev_btn.hide()
+        self.after_panel.next_btn.hide()
 
     def browse_input_dir(self):
         """选择输入目录"""
@@ -1423,7 +1471,18 @@ class BlackCircleRemoverPage(QWidget):
         data = item.data(0, Qt.UserRole)
         if data and data[0] == "file":
             filepath = data[1]
-            # 更新当前索引
+            if filepath in self._tree_files:
+                self._tree_current_idx = self._tree_files.index(filepath)
+                self._update_nav_buttons()
+            self.preview_file_by_path(filepath)
+
+    def on_tree_current_changed(self, current, previous):
+        """键盘上下键移动选中项时联动预览"""
+        if current is None:
+            return
+        data = current.data(0, Qt.UserRole)
+        if data and data[0] == "file":
+            filepath = data[1]
             if filepath in self._tree_files:
                 self._tree_current_idx = self._tree_files.index(filepath)
                 self._update_nav_buttons()
@@ -1442,14 +1501,15 @@ class BlackCircleRemoverPage(QWidget):
             img.load()
             self.before_panel.show_pil_image(img, margin_mm=edge_mm, dpi=dpi_val)
             self.before_panel._filepath = filepath
+            self.before_panel.path_label.setText(filepath)
         except Exception:
             pass
-        # 处理后结果：严格按相对路径匹配
+        # 处理后结果：严格按相对路径匹配（在输出目录下找相同目录结构下的同名文件）
         self.after_panel.clear()
+        self.after_panel.path_label.setText("")
         output_dir = self.output_dir.text().strip()
         root_dir = getattr(self, '_tree_root_dir', '') or self.input_dir.text().strip()
         if output_dir and os.path.isdir(output_dir) and root_dir:
-            # 计算输入文件相对于输入根目录的相对路径
             rel = os.path.relpath(filepath, root_dir)
             after_path = os.path.join(output_dir, rel)
             if os.path.isfile(after_path):
@@ -1458,6 +1518,7 @@ class BlackCircleRemoverPage(QWidget):
                     img2.load()
                     self.after_panel.show_pil_image(img2)
                     self.after_panel._filepath = after_path
+                    self.after_panel.path_label.setText(after_path)
                 except Exception:
                     pass
 
