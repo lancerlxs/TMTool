@@ -16,7 +16,7 @@ import numpy as np
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
-                             QFileDialog, QTextEdit, QSpinBox,
+                             QFileDialog, QTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QCheckBox,
                              QProgressBar, QGraphicsView, QGraphicsScene,
                              QScrollArea, QDoubleSpinBox, QSplitter, QSizePolicy,
@@ -1058,10 +1058,10 @@ class PreviewPanel(QWidget):
         layout.setSpacing(4)
 
         # 标题栏
-        header = QLabel(title)
-        header.setAlignment(Qt.AlignCenter)
-        header.setStyleSheet("color: #00F0FF; font-size: 14px; font-weight: bold; padding: 2px;")
-        layout.addWidget(header)
+        self.header = QLabel(title)
+        self.header.setAlignment(Qt.AlignCenter)
+        self.header.setStyleSheet("font-size: 14px; font-weight: bold; padding: 2px;")
+        layout.addWidget(self.header)
 
         # 导航栏
         nav = QHBoxLayout()
@@ -1193,9 +1193,49 @@ class BlackCircleRemoverPage(QWidget):
     QCheckBox::indicator:checked { background-color: #00F0FF; border: 1px solid #00F0FF; }
     """
 
+    LIGHT_QSS = """
+    QWidget { background-color: #ecf0f1; color: #2c3e50; font-family: 'Microsoft YaHei', Arial; font-size: 14px; }
+    QGroupBox {
+        border: 2px solid #aed6f1; border-radius: 8px; margin-top: 15px; padding: 15px;
+        font-weight: bold; color: #1a5276; background-color: #ffffff;
+    }
+    QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+    QLineEdit, QSpinBox, QComboBox {
+        background-color: white; border: 1px solid #bdc3c7; border-radius: 4px;
+        padding: 5px; color: #2c3e50;
+    }
+    QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #3498db; }
+    QSpinBox::up-button, QSpinBox::down-button { background-color: #d6eaf8; border: none; width: 18px; }
+    QSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #bdc3c7; }
+    QSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #bdc3c7; border-top: 1px solid #bdc3c7; }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #aed6f1; }
+    QSpinBox::up-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-bottom: 5px solid #2c3e50; width: 0px; height: 0px; }
+    QSpinBox::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid #2c3e50; width: 0px; height: 0px; }
+    QPushButton#ActionBtn { background-color: #27ae60; color: white; border: none; padding: 8px 16px; border-radius: 5px; font-weight: bold; }
+    QPushButton#ActionBtn:hover { background-color: #2ecc71; }
+    QPushButton#ActionBtn:disabled { background-color: #bdc3c7; }
+    QPushButton#BrowseBtn { background-color: #2980b9; color: white; border: none; padding: 5px 10px; border-radius: 4px; }
+    QPushButton#BrowseBtn:hover { background-color: #3498db; }
+    QTextEdit { background-color: white; border: 1px solid #bdc3c7; border-radius: 4px; color: #2c3e50; font-size: 13px; }
+    QProgressBar { background-color: white; border: 1px solid #bdc3c7; border-radius: 4px; text-align: center; color: #2c3e50; font-weight: bold; }
+    QProgressBar::chunk { background-color: #27ae60; border-radius: 3px; }
+    QCheckBox { color: #2c3e50; }
+    QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #bdc3c7; border-radius: 3px; background-color: white; }
+    QCheckBox::indicator:checked { background-color: #3498db; border: 1px solid #3498db; }
+    """
+
+    _DARK_COLORS = {
+        'accent': '#00F0FF', 'text': '#E0E0E0', 'secondary': '#8B949E',
+        'bg_dark': '#0D1117', 'border': '#30363D', 'view_bg': '#1a1a2e',
+    }
+    _LIGHT_COLORS = {
+        'accent': '#1a5276', 'text': '#2c3e50', 'secondary': '#7f8c8d',
+        'bg_dark': '#ffffff', 'border': '#bdc3c7', 'view_bg': '#d5dbdb',
+    }
+
     def __init__(self):
         super().__init__()
-        self.setStyleSheet(self.DARK_QSS)
+        self._current_theme = 'light'
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(15, 10, 15, 12)
         self.layout.setSpacing(8)
@@ -1207,12 +1247,12 @@ class BlackCircleRemoverPage(QWidget):
         left_layout.setSpacing(8)
 
         # 标题
-        lbl_title = QLabel("图像质检工具")
-        lbl_title.setAlignment(Qt.AlignCenter)
-        lbl_title.setStyleSheet(
-            "color: #00F0FF; font-size: 26px; font-weight: bold;"
+        self.lbl_title = QLabel("图像质检工具")
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        self.lbl_title.setStyleSheet(
+            "font-size: 26px; font-weight: bold;"
             "font-family: 'SimHei','黑体','Microsoft YaHei'; padding: 2px 0 6px 0;")
-        left_layout.addWidget(lbl_title)
+        left_layout.addWidget(self.lbl_title)
 
         # 设置组
         group = QGroupBox("处理设置")
@@ -1287,6 +1327,13 @@ class BlackCircleRemoverPage(QWidget):
         self.edge_margin_spin.valueChanged.connect(self._refresh_edge_preview)
         form.addRow("边缘覆盖:", self.edge_cover_check)
 
+        # 主题选择
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("浅色界面")
+        self.theme_combo.addItem("褐色界面")
+        self.theme_combo.currentIndexChanged.connect(self._switch_theme)
+        form.addRow("界面风格:", self.theme_combo)
+
         # 线程数设置
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 8)
@@ -1298,7 +1345,7 @@ class BlackCircleRemoverPage(QWidget):
         left_layout.addWidget(group)
 
         # 说明文本
-        info_label = QLabel(
+        self.info_label = QLabel(
             "功能说明：\n"
             "• 递归扫描指定目录及子目录下的所有JPG文件\n"
             "• 智能检测文字和竖线边界，自动确定检测区域\n"
@@ -1309,8 +1356,8 @@ class BlackCircleRemoverPage(QWidget):
             "• 右侧预览区可预览原图和处理后的效果\n"
             "• 支持鼠标滚轮缩放、拖拽查看"
         )
-        info_label.setStyleSheet("color: #8B949E; font-size: 14px;")
-        left_layout.addWidget(info_label)
+        self.info_label.setStyleSheet("font-size: 14px;")
+        left_layout.addWidget(self.info_label)
 
         # 按钮区域
         btn_layout = QHBoxLayout()
@@ -1354,9 +1401,9 @@ class BlackCircleRemoverPage(QWidget):
         tree_container = QWidget()
         tree_layout = QVBoxLayout(tree_container)
         tree_layout.setContentsMargins(2, 2, 2, 2)
-        tree_label = QLabel("文件浏览器")
-        tree_label.setStyleSheet("color: #00F0FF; font-weight: bold; padding: 2px;")
-        tree_layout.addWidget(tree_label)
+        self.tree_label = QLabel("文件浏览器")
+        self.tree_label.setStyleSheet("font-weight: bold; padding: 2px;")
+        tree_layout.addWidget(self.tree_label)
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setStyleSheet("""
@@ -1379,6 +1426,9 @@ class BlackCircleRemoverPage(QWidget):
         self.main_splitter.setSizes([300, 200, 500])
         self.layout.addWidget(self.main_splitter, 1)
 
+        # 应用默认主题
+        self.apply_theme()
+
         # 存储处理结果
         self.process_results = []
         self.worker = None
@@ -1390,6 +1440,51 @@ class BlackCircleRemoverPage(QWidget):
         # 处理结果预览取消上一页/下一页，只随动原图预览
         self.after_panel.prev_btn.hide()
         self.after_panel.next_btn.hide()
+
+    def apply_theme(self):
+        """根据当前主题应用对应的界面样式"""
+        colors = self._DARK_COLORS if self._current_theme == 'dark' else self._LIGHT_COLORS
+        qss = self.DARK_QSS if self._current_theme == 'dark' else self.LIGHT_QSS
+        self.setStyleSheet(qss)
+        # 更新标题颜色
+        self.lbl_title.setStyleSheet(
+            f"color: {colors['accent']}; font-size: 26px; font-weight: bold;"
+            f"font-family: 'SimHei','黑体','Microsoft YaHei'; padding: 2px 0 6px 0;")
+        # 更新说明文本颜色
+        self.info_label.setStyleSheet(f"color: {colors['secondary']}; font-size: 14px;")
+        # 更新文件浏览器标题颜色
+        self.tree_label.setStyleSheet(f"color: {colors['accent']}; font-weight: bold; padding: 2px;")
+        # 更新文件树样式
+        self.file_tree.setStyleSheet(
+            f"QTreeWidget {{ background-color: {colors['bg_dark']}; border: 1px solid {colors['border']};"
+            f" border-radius: 3px; font-size: 13px; color: {colors['text']}; }}"
+            f"QTreeWidget::item {{ padding: 3px; }}"
+            f"QTreeWidget::item:selected {{ background-color: #1F6FEB; color: white; }}")
+        # 更新树节点颜色
+        root = self.file_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            dir_item = root.child(i)
+            dir_item.setForeground(0, QColor(colors['accent']))
+        # 更新预览面板样式
+        for panel in [self.before_panel, self.after_panel]:
+            panel.header.setStyleSheet(
+                f"color: {colors['accent']}; font-size: 14px; font-weight: bold; padding: 2px;")
+            panel.page_label.setStyleSheet(f"color: {colors['text']}; font-size: 12px;")
+            panel.path_label.setStyleSheet(f"color: {colors['secondary']}; font-size: 14px; padding: 3px;")
+        # 更新图像视图背景
+        for panel in [self.before_panel, self.after_panel]:
+            panel.image_view.setStyleSheet(
+                f"background-color: {colors['view_bg']}; border: 1px solid {colors['border']}; border-radius: 3px;")
+
+    def _switch_theme(self, index):
+        """切换界面主题：0=浅色界面，1=褐色界面"""
+        self._current_theme = 'light' if index == 0 else 'dark'
+        self.apply_theme()
+        # 重新预览当前文件以更新图像视图背景
+        files = getattr(self, '_tree_files', [])
+        idx = getattr(self, '_tree_current_idx', -1)
+        if 0 <= idx < len(files):
+            self.preview_file_by_path(files[idx])
 
     def browse_input_dir(self):
         """选择输入目录"""
