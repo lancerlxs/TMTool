@@ -5,6 +5,7 @@
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -51,9 +52,17 @@ COL_NAMES = [
 ]
 
 
+def _app_dir():
+    """获取应用程序所在目录（兼容PyInstaller打包后的路径）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，sys.executable 指向 exe 文件
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _data_file():
     """数据文件路径：与程序同目录下的 daily_reports.json"""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'daily_reports.json')
+    return os.path.join(_app_dir(), 'daily_reports.json')
 
 
 def load_all_data():
@@ -231,7 +240,7 @@ def get_default_archive_category():
 
 def _categories_file():
     """归档类别数据文件"""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'archive_categories.json')
+    return os.path.join(_app_dir(), 'archive_categories.json')
 
 
 def load_categories():
@@ -278,7 +287,7 @@ def set_day_categories(cats, date_str, cat_list):
 
 def _baselines_file():
     """基准值数据文件"""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'baselines.json')
+    return os.path.join(_app_dir(), 'baselines.json')
 
 
 def load_baselines():
