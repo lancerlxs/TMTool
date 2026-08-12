@@ -656,10 +656,14 @@ class CircleDetectionWorker(QThread):
     @staticmethod
     def _is_solid_dark_disk(gray, cx, cy, r, img_w, img_h):
         """
-        径向对比度验证候选是否为实心暗圆盘(真装订孔)。
-        真孔：中心区域(0~0.5r)明显暗于外环(1.1~1.5r)，对比度大(典型>=140)；
-        伪圆(表格/印章粘连)：中心与外环亮度接近，对比度小(典型<=80)。
-        阈值取 100：真孔通常>=140，伪圆通常<=80，留出安全裕度。
+        验证候选是否为实心暗圆盘(真装订孔)。真孔光学上是穿透的黑洞，中心区域
+        像素极暗(灰度很低)，无论页面底色明暗。据此分两条判据(满足其一即通过)：
+        1. 中心绝对暗度：中心区(0~0.5r)灰度均值 < 50。真孔中心典型 1-10；
+           表格/印章粘连伪圆中心通常 >100。这是最可靠的判据，且不受扫描件
+           底色偏暗的影响(暗底扫描件的孔中心依然极暗)。
+        2. 径向对比度：中心明显暗于外环(1.1~1.5r)，对比度 >=100。白底扫描件
+           的真孔中心暗、外环白，对比度大(>=140)；伪圆对比度小(<=80)。
+           仅当中心暗度判据未通过(如孔中心采样恰好落在碎块间隙)时作兜底。
         """
         import math
         r = max(int(r), 4)
@@ -671,7 +675,10 @@ class CircleDetectionWorker(QThread):
         if center_box.size == 0:
             return True
         center_mean = float(center_box.mean())
-        # 外环采样(1.1r~1.5r 圆环上 12 个方向)
+        # 判据1：中心绝对暗度
+        if center_mean < 50:
+            return True
+        # 判据2：径向对比度
         outer_vals = []
         for ang_deg in range(0, 360, 30):
             rad = math.radians(ang_deg)
