@@ -115,13 +115,25 @@ def _estimate_skew(pil_img, max_angle=8.0):
     优先用投影方差法；若其信号弱(置信比<1.2)，回退到 Hough 直线法
     (对小角度约1°的文字/表单图更灵敏)。两种方法的角度都已与 PIL rotate 对齐。
 
-    防过度纠偏：投影法是“页面是否倾斜”的可靠指标——ratio≈1 表示页面平整、
-    无明显偏斜。此时即使 Hough 给出某角度，也常是把表格线/图形线段误当倾斜线。
-    故当投影法明确认为平整(ratio<1.1)时，只有 Hough 高置信(conf>=60)才采信，
-    否则判定无偏斜，避免把平整页强行旋转而引入倾斜。
+    防过度纠偏(两处)：
+    1. 投影法 ratio≈1 表示页面平整。此时即使 Hough 给出某角度，也常是把表格线/
+       图形线段误当倾斜线。故投影法认为平整(ratio<1.1)时，只有 Hough 高置信
+       (conf>=60)才采信，否则判定无偏斜。
+    2. 投影法对宽表格图可能在大角度产生伪峰值：角度大(>=3°)但置信比低(<1.4，
+       真实大偏斜的 ratio 通常>>1.4)。这种伪峰值与真实倾斜的区别在于 Hough：
+       表格图的表格线是直线，Hough 能可靠测得其真实倾角；而投影法伪峰值与
+       Hough 角度明显不一致。故“投影法角度大但 ratio 低”时改信 Hough(若高置信)，
+       Hough 信号也不足才判无偏斜。
     """
     ang, ratio = _projection_skew(pil_img, max_angle)
     if ratio >= 1.2 and abs(ang) >= 0.1:
+        # 投影法“大角度+低置信比”可能是宽表格图伪峰值，改用 Hough 裁决。
+        if abs(ang) >= 3.0 and ratio < 1.4:
+            ang_h, conf = _hough_skew(pil_img)
+            if conf >= 50:
+                # Hough 高置信：以其角度为准(表格图 Hough 可靠)
+                return (ang_h, 2.0) if abs(ang_h) >= 0.1 else (0.0, 1.0)
+            return 0.0, 1.0  # 两法都不可靠，不纠偏
         return ang, ratio
     # 投影法信号不足：回退 Hough 直线法
     ang_h, conf = _hough_skew(pil_img)
