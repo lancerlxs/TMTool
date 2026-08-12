@@ -114,13 +114,21 @@ def _estimate_skew(pil_img, max_angle=8.0):
     估计图像内容偏斜角(度)。返回 (旋转角, 置信比)。
     优先用投影方差法；若其信号弱(置信比<1.2)，回退到 Hough 直线法
     (对小角度约1°的文字/表单图更灵敏)。两种方法的角度都已与 PIL rotate 对齐。
+
+    防过度纠偏：投影法是“页面是否倾斜”的可靠指标——ratio≈1 表示页面平整、
+    无明显偏斜。此时即使 Hough 给出某角度，也常是把表格线/图形线段误当倾斜线。
+    故当投影法明确认为平整(ratio<1.1)时，只有 Hough 高置信(conf>=60)才采信，
+    否则判定无偏斜，避免把平整页强行旋转而引入倾斜。
     """
     ang, ratio = _projection_skew(pil_img, max_angle)
     if ratio >= 1.2 and abs(ang) >= 0.1:
         return ang, ratio
     # 投影法信号不足：回退 Hough 直线法
     ang_h, conf = _hough_skew(pil_img)
-    if conf >= 30 and abs(ang_h) >= 0.1:
+    # 投影法认为页面基本平整(ratio<1.1)时，提高 Hough 采信门槛，
+    # 避免低置信 Hough 把平整页误判为倾斜。
+    hough_conf_min = 60 if ratio < 1.1 else 30
+    if conf >= hough_conf_min and abs(ang_h) >= 0.1:
         return ang_h, 2.0  # Hough 高置信，合成 ratio 让 _deskew_image 放行
     return 0.0, 1.0
 
@@ -317,7 +325,7 @@ class CircleDetectionWorker(QThread):
             arr = np.array(img)
             gray_full = (np.mean(arr, axis=2).astype(np.uint8) if arr.ndim == 3 else arr.copy())
             mask_full = gray_full < 50  # 装订孔检测阈值(灰度<50=足够暗)
-            circles_info = self.detect_edge_holes(mask_full, orig_w, orig_h)
+            circles_info = self.detect_edge_holes(mask_full, orig_w, orig_h, gray_full)
             del arr, gray_full, mask_full
             circles_info = self._dedup_circles(circles_info)
 
@@ -502,7 +510,7 @@ class CircleDetectionWorker(QThread):
 
         return circles
 
-    def detect_edge_holes(self, mask, img_w, img_h):
+    def detect_edge_holes(self, mask, img_w, img_h, gray=None):
         """Edge band hole detection (single pass, default solidity)."""
         mp = self.margin_pixels
         candidates = []
@@ -516,9 +524,46 @@ class CircleDetectionWorker(QThread):
                 candidates.append((cx, cy, r, 'T'))
             for cx, cy, r in self.detect_circle_region(mask[img_h - mp:, :], 0, mp):
                 candidates.append((cx, cy + (img_h - mp), r, 'B'))
-        return self._filter_punch_holes(candidates, img_w, img_h)
+        return self._filter_punch_holes(candidates, img_w, img_h, mask, gray)
 
-    def _filter_punch_holes(self, candidates, img_w, img_h):
+    def _is_isolated_hole(self, mask, cx, cy, r, img_w, img_h):
+        """
+        判断一个候选是否为真装订孔(用于排除标题/印章粘连块)。
+        真孔四周贴近区是白纸，邻域环带内没有其它黑色连通域；而标题/印章粘连块
+        紧邻其它笔画，环带内会出现多个独立黑色连通域。
+        在候选外围环带(1.3r~2.2r)统计独立黑色连通域数。
+        环带半径取 2.2r(而非更大)：真孔即使附近有表格/文字行(2.2r 外)，贴近区
+        仍是干净的；标题粘连块的相邻笔画就在 2.2r 内。阈值 sibs<3：
+        真孔贴近区兄弟=0；标题块 2.2r 典型>=4。
+        """
+        r = int(r)
+        inner = int(r * 1.3)   # 略大于候选本体，排除候选自身
+        outer = int(r * 2.2)
+        x0, x1 = max(0, cx - outer), min(img_w, cx + outer + 1)
+        y0, y1 = max(0, cy - outer), min(img_h, cy + outer + 1)
+        sub = mask[y0:y1, x0:x1]
+        if sub.size == 0:
+            return True
+        Hs, Ws = sub.shape
+        yy, xx = np.mgrid[0:Hs, 0:Ws]
+        sx, sy = (cx - x0), (cy - y0)
+        dist2 = (xx - sx) ** 2 + (yy - sy) ** 2
+        ring = (dist2 >= inner * inner) & (dist2 <= outer * outer)
+        if ring.sum() < 20:
+            return True  # 环带太小，无法判断，保守放行
+        # 环带内的独立黑色连通域数(候选自身在 inner 之内，不计入)
+        ring_fg = (ring & (sub > 0)).astype(np.uint8)
+        try:
+            import cv2
+            n_cc, _, _, _ = cv2.connectedComponentsWithStats(ring_fg, 8)
+            sibs = n_cc - 1  # 减去背景
+        except Exception:
+            # 无 cv2 回退：用黑色像素占比近似
+            sibs = 99 if float(ring_fg.mean()) > 0.05 else 0
+        # 真孔贴近区兄弟连通域=0；标题/印章区 2.2r 典型>=4
+        return sibs < 3
+
+    def _filter_punch_holes(self, candidates, img_w, img_h, mask=None, gray=None):
         """Filter punch holes from edge candidates."""
         if not candidates:
             return []
@@ -549,9 +594,26 @@ class CircleDetectionWorker(QThread):
                     cols.append([c])
             min_iso = self.max_diameter_pixels * 0.045
             max_per_col = 6  # 超过6个的列/排是文字(如标题行)，不是装订孔
+            # 文字行 vs 装订孔列 判别：统计“大候选”数量。
+            # 大候选 = 半径 >= 0.5*列内最大半径 且 >= 绝对阈值(12px)。
+            # 装订孔列：真孔通常 3-6 个一排，大候选 >= 3；
+            # 标题/文字行：即使笔画粘连成大块，大候选也只有 1-2 个(<=2)。
+            # 用“大候选计数”比“半径中位数”更稳健——真孔列混入再多表格碎块
+            # 也不影响大候选计数，而碎块会拉低中位数导致误杀。
+            big_abs_r = max(self.max_diameter_pixels * 0.05, 12)
             for col in cols:
-                # 计算相对尺寸阈值：排除单个异常大值(如角落扫描伪影)的干扰
                 radii = sorted([c[2] for c in col])
+                max_r = radii[-1]
+                n_big = sum(1 for rr in radii if rr >= 0.5 * max_r and rr >= big_abs_r)
+                # 文字行：大候选 < 3 → 整组丢弃
+                if n_big < 3:
+                    # 仅当确无成排大孔时才视为文字；保留极少数(<3)大候选
+                    # 交给后续 _is_isolated_hole 邻域终检做最后裁决。
+                    big_candidates = [(cx, cy, r) for cx, cy, r in col
+                                      if r >= 0.5 * max_r and r >= big_abs_r]
+                    kept.extend(big_candidates)
+                    continue
+                # 计算相对尺寸阈值：排除单个异常大值(如角落扫描伪影)的干扰
                 if len(radii) >= 3 and radii[-1] > radii[-2] * 1.5:
                     ref_r = radii[-2]  # 最大值是异常值，用第二大
                 else:
@@ -566,7 +628,51 @@ class CircleDetectionWorker(QThread):
                     cx, cy, r = col[0]
                     if r >= min_iso:
                         kept.append((cx, cy, r))
+        # 终检1 邻域上下文：逐一验证候选四周是否有其它黑色连通域(相邻文字笔画)。
+        # 真孔处于白纸区(无兄弟)；标题/印章粘连块四周密布其它笔画 → 排除。
+        if mask is not None and kept:
+            kept = [c for c in kept
+                    if self._is_isolated_hole(mask, c[0], c[1], c[2], img_w, img_h)]
+        # 终检2 径向对比度：真装订孔是中心暗、向外亮的实心圆盘(中心 vs 外环
+        # 灰度差大)；而闭运算把表格线/印章/散点连成的伪圆，中心与外环亮度接近
+        # (对比度小)。有灰度图时启用，用对比度阈值剔除这类伪圆。
+        if gray is not None and kept:
+            kept = [c for c in kept
+                    if self._is_solid_dark_disk(gray, c[0], c[1], c[2], img_w, img_h)]
         return kept
+
+    @staticmethod
+    def _is_solid_dark_disk(gray, cx, cy, r, img_w, img_h):
+        """
+        径向对比度验证候选是否为实心暗圆盘(真装订孔)。
+        真孔：中心区域(0~0.5r)明显暗于外环(1.1~1.5r)，对比度大(典型>=140)；
+        伪圆(表格/印章粘连)：中心与外环亮度接近，对比度小(典型<=80)。
+        阈值取 100：真孔通常>=140，伪圆通常<=80，留出安全裕度。
+        """
+        import math
+        r = max(int(r), 4)
+        # 中心区域均值
+        ri = max(2, r // 3)
+        x0, x1 = max(0, cx - ri), min(img_w, cx + ri + 1)
+        y0, y1 = max(0, cy - ri), min(img_h, cy + ri + 1)
+        center_box = gray[y0:y1, x0:x1]
+        if center_box.size == 0:
+            return True
+        center_mean = float(center_box.mean())
+        # 外环采样(1.1r~1.5r 圆环上 12 个方向)
+        outer_vals = []
+        for ang_deg in range(0, 360, 30):
+            rad = math.radians(ang_deg)
+            for mul in (1.2, 1.45):
+                ox = cx + int(r * mul * math.cos(rad))
+                oy = cy + int(r * mul * math.sin(rad))
+                if 0 <= ox < img_w and 0 <= oy < img_h:
+                    outer_vals.append(float(gray[oy, ox]))
+        if not outer_vals:
+            return True
+        outer_mean = float(np.mean(outer_vals))
+        contrast = outer_mean - center_mean
+        return contrast >= 100
 
     @staticmethod
     def _dedup_circles(circles):
@@ -620,16 +726,32 @@ class CircleDetectionWorker(QThread):
         """
         circles = []
         height, width = region_mask.shape
-        
+
         # 查找黑色像素的行和列
         black_rows, black_cols = np.where(region_mask)
-        
+
         if len(black_rows) == 0:
             return circles
 
         # 简单的聚类方法：将接近的黑色像素归为一组
         min_distance = self.max_diameter_pixels // 2
-        
+
+        # 形态学闭运算：把因阈值边缘不饱满而被切碎的装订孔碎片重新合并成整圆。
+        # 某些扫描件装订孔灰度均值仅 47-56，严格阈值(<50)会切掉孔的浅色边缘，
+        # 导致一个整孔碎裂成多个细长小块，达不到实心度/宽高比要求而漏检。
+        # 用接近预期孔半径的椭圆核做闭运算，能在不放宽灰度阈值(避免引入文字)
+        # 的前提下让碎片重连。无 cv2 时跳过(降级为原行为)。
+        raw_mask = region_mask  # 保留闭运算前的掩码，用于后续验证
+        try:
+            import cv2
+            # 闭运算核半径：取预期装订孔半径的约一半(常见孔半径15-40px → 核半径10)
+            k = max(7, int(self.max_diameter_pixels * 0.035))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k * 2 + 1, k * 2 + 1))
+            closed = cv2.morphologyEx(region_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+            region_mask = closed > 0
+        except Exception:
+            pass
+
         # 使用连通分量标记（优先 cv2，极快）
         num_fg, stats = self._connected_components_with_stats(region_mask)
 
@@ -661,6 +783,9 @@ class CircleDetectionWorker(QThread):
             min_big_diam = self.max_diameter_pixels * 0.09
             if not (solidity >= 0.5 or (solidity >= 0.45 and diameter >= min_big_diam)):
                 continue
+
+            # 闭运算前验证已下放：detect_circle_region 只负责几何筛选，
+            # 伪圆(表格线粘连)的剔除交给 _is_isolated_hole 的邻域上下文终检。
 
             # 计算中心点和半径
             center_y = (min_row + max_row) // 2
