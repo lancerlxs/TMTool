@@ -168,7 +168,7 @@ class CircleDetectionWorker(QThread):
     finished_signal = Signal(bool, str)
     file_done_signal = Signal(str)  # 单个文件处理完成后发射其输出路径
 
-    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, deskew=False, remove_border=True, thread_count=4, edge_cover=False, edge_margin_mm=2.0, dpi=300, parent=None):
+    def __init__(self, input_dir, output_dir, max_diameter_mm=25, margin_mm=40, deskew=False, remove_border=True, thread_count=4, edge_cover=False, edge_margin_mm=2.0, dpi=300, auto_darken=True, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -179,6 +179,7 @@ class CircleDetectionWorker(QThread):
         self.thread_count = thread_count
         self.edge_cover = edge_cover
         self.edge_margin_mm = edge_margin_mm
+        self.auto_darken = auto_darken
         self.is_stopped = False
         self.dpi_assumption = dpi
         self.max_diameter_pixels = int(self.max_diameter_mm * self.dpi_assumption / 25.4)
@@ -213,6 +214,7 @@ class CircleDetectionWorker(QThread):
             results = []
             processed = [0]
             deskew_count = [0]
+            darken_count = [0]
             holed_file_count = [0]
             hole_count_total = [0]
             lock = threading.Lock()
@@ -232,7 +234,7 @@ class CircleDetectionWorker(QThread):
             wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             wlog(f"输入目录: {self.input_dir}")
             wlog(f"输出目录: {self.output_dir}")
-            wlog(f"圆圈最大直径: {self.max_diameter_mm}mm；纠偏: {'开启' if self.deskew else '关闭'}；线程数: {self.thread_count}")
+            wlog(f"圆圈最大直径: {self.max_diameter_mm}mm；纠偏: {'开启' if self.deskew else '关闭'}；自动加深: {'开启' if self.auto_darken else '关闭'}；线程数: {self.thread_count}")
             wlog("=" * 70)
 
             def process_one(jpg_path, idx):
@@ -245,7 +247,7 @@ class CircleDetectionWorker(QThread):
                 except Exception as e:
                     result = {'path': jpg_path, 'filename': os.path.basename(jpg_path),
                               'success': False, 'error_msg': str(e),
-                              'circles_found': 0, 'deskew_angle': 0.0}
+                              'circles_found': 0, 'deskew_angle': 0.0, 'darken_applied': False}
                 with lock:
                     results.append(result)
                     holes = result.get('circles_found', 0)
@@ -255,18 +257,25 @@ class CircleDetectionWorker(QThread):
                     da = result.get('deskew_angle', 0.0) or 0.0
                     if da:
                         deskew_count[0] += 1
+                    dk = result.get('darken_applied', False)
+                    if dk:
+                        darken_count[0] += 1
                     processed[0] += 1
                     if result['success']:
                         parts = [f"✓ {os.path.basename(jpg_path)}"]
                         if self.deskew:
                             parts.append(f"纠偏{da}°" if da else "无需纠偏")
                         parts.append(f"装订孔{holes}个" if holes else "无装订孔")
+                        if self.auto_darken:
+                            parts.append("已加深" if dk else "无需加深")
                         self.log_signal.emit("  ".join(parts))
                     else:
                         self.log_signal.emit(f"✗ {os.path.basename(jpg_path)} - 失败 {result.get('error_msg', '')}")
                     wlog(f"  装订孔: {'检测并填充 %d 个' % holes if holes else '未检测到'}")
                     if self.deskew:
                         wlog(f"  纠偏: {'已纠正 %.2f°' % da if da else '无明显偏斜，未纠偏'}")
+                    if self.auto_darken:
+                        wlog(f"  加深: {'文字偏浅，已加深' if dk else '文字已足够深，未加深'}")
                     wlog(f"  结果: {'成功' if result['success'] else '失败: ' + str(result.get('error_msg', ''))}")
                     wlog(f"  输出: {result.get('output_path', '')}")
                     if result['success'] and result.get('output_path'):
@@ -293,6 +302,7 @@ class CircleDetectionWorker(QThread):
             wlog(f"总计文件: {processed[0]}（成功 {success_count}，失败 {processed[0] - success_count}）")
             wlog(f"去装订孔: {holed_file_count[0]} 个文件，共 {hole_count_total[0]} 个孔")
             wlog(f"纠偏: {deskew_count[0]} 个文件")
+            wlog(f"加深: {darken_count[0]} 个文件")
             if self.is_stopped:
                 wlog("注意：处理被用户中途停止")
             logf.close()
@@ -302,7 +312,8 @@ class CircleDetectionWorker(QThread):
                 self.result_signal.emit(results)
                 msg = (f"处理完成！共 {processed[0]} 个文件，成功 {success_count}；"
                        f"去孔 {holed_file_count[0]} 文件/{hole_count_total[0]} 个；"
-                       f"纠偏 {deskew_count[0]} 个文件。日志: {os.path.basename(log_path)}")
+                       f"纠偏 {deskew_count[0]} 个文件；"
+                       f"加深 {darken_count[0]} 个文件。日志: {os.path.basename(log_path)}")
                 self.finished_signal.emit(True, msg)
             else:
                 self.finished_signal.emit(False, f"处理已停止。日志: {os.path.basename(log_path)}")
@@ -312,6 +323,22 @@ class CircleDetectionWorker(QThread):
 
     def stop(self):
         self.is_stopped = True
+
+    def darken_text(self, img, gamma=1.3):
+        """
+        自动加深文字：对较暗的文字像素(灰度<200)做幂律加深，背景(>200)不变。
+        gamma>1 使中间调(浅灰文字)变暗，让文字更黑更清晰，接近高对比扫描件的效果。
+        仅当文字偏浅时调用(由 process_image 根据文字平均灰度判断)。
+        """
+        arr = np.array(img).astype(np.float64)
+        gray = arr.mean(axis=2) if arr.ndim == 3 else arr.copy()
+        mask = gray < 200  # 文字/图形区域(非背景)
+        if not mask.any():
+            return img
+        # 对文字像素做幂律加深: new = 200*(g/200)^gamma
+        norm = arr[mask] / 200.0
+        arr[mask] = np.clip(200.0 * np.power(norm, gamma), 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
 
     def process_image(self, image_path):
         """
@@ -352,6 +379,19 @@ class CircleDetectionWorker(QThread):
             if self.edge_cover and self.edge_margin_pixels > 0:
                 img = self.cover_edge_with_bg(img, self.edge_margin_pixels)
 
+            # --- 自动加深文字 ---
+            darken_applied = False
+            if self.auto_darken:
+                # 判断文字是否偏浅：统计文字像素(灰度<150)的平均灰度，
+                # 偏浅(>110)才加深；已经很深的文字不处理，避免过度加深。
+                arr_chk = np.array(img)
+                gray_chk = (arr_chk.mean(axis=2).astype(np.uint8)
+                            if arr_chk.ndim == 3 else arr_chk.copy())
+                text_px = gray_chk[(gray_chk > 30) & (gray_chk < 150)]
+                if text_px.size > 500 and float(text_px.mean()) > 110:
+                    img = self.darken_text(img, gamma=1.3)
+                    darken_applied = True
+
             # 输出路径（保持原目录结构），确保每个文件都写入目标目录
             rel_path = os.path.relpath(image_path, self.input_dir)
             output_path = os.path.join(self.output_dir, rel_path)
@@ -369,6 +409,7 @@ class CircleDetectionWorker(QThread):
                 'success': True,
                 'circles_found': len(circles_info),
                 'deskew_angle': deskew_applied,
+                'darken_applied': darken_applied,
                 'output_path': output_path,
                 'preview_before': image_path,
                 'preview_after': output_path
@@ -381,7 +422,8 @@ class CircleDetectionWorker(QThread):
                 'success': False,
                 'error_msg': str(e),
                 'circles_found': 0,
-                'deskew_angle': 0.0
+                'deskew_angle': 0.0,
+                'darken_applied': False
             }
 
     def detect_detection_boundaries(self, black_mask, img_width, img_height):
@@ -999,13 +1041,27 @@ class CircleDetectionWorker(QThread):
                         (b > 0.9 * H and (H - t) < 0.3 * H))
             if not depth_ok:
                 continue
+            # 填充率检查：真实扫描黑边/阴影是实心暗块(bbox 内填充率高，>25%)；
+            # 表格网格线/单元格边框是稀疏线条(bbox 内填充率低，<20%，中间白底)。
+            # 稀疏线条不是黑边，跳过，避免误删表格。
+            bbox_area = w * h
+            if bbox_area > 0 and (a / bbox_area) < 0.20:
+                continue
             comp = labels == i
             # 纹理检查：横贯全幅(>75%宽)的顶部/底部条，或纵贯全幅(>75%高)的左/右条，
-            # 不论纹理都去除(它们是整幅黑条，纹理来自边缘过渡而非文字)。
-            # 其余局部暗块：实心黑(均值<60)直接去；灰色阴影若>10%含高纹理(文字)则跳过
+            # 原本不论纹理都去除(假设是整幅扫描黑条)。但表格的横/竖线也会横贯全幅
+            # 且靠近顶/底边，会被误当黑条。区别在于：真实扫描黑边是实心暗条(bbox 内
+            # 填充率高，>30%)；表格线条稀疏(bbox 内填充率低，<20%，中间是白底)。
+            # 故 spans_full 块再加填充率检查：稀疏线条(表格)跳过，实心黑条才去除。
             spans_full = (w > 0.75 * W and (t < 0.1 * H or b > 0.9 * H)) or \
                          (h > 0.75 * H and (l < 0.1 * W or r > 0.9 * W))
-            if not spans_full:
+            if spans_full:
+                bbox_area = w * h
+                fill_rate = (a / bbox_area) if bbox_area > 0 else 1.0
+                if fill_rate < 0.20:
+                    continue  # 稀疏线条=表格网格，不是实心黑边，跳过
+            else:
+                # 其余局部暗块：实心黑(均值<60)直接去；灰色阴影若>10%含高纹理(文字)则跳过
                 comp_mean_gray = float(gray[comp].mean())
                 if comp_mean_gray >= 60 and (local_std[comp] > 50).mean() > 0.10:
                     continue
@@ -1471,6 +1527,12 @@ class BlackCircleRemoverPage(QWidget):
         self.edge_margin_spin.valueChanged.connect(self._refresh_edge_preview)
         form.addRow("边缘覆盖:", self.edge_cover_check)
 
+        # 自动加深文字选项(默认选中)
+        self.darken_check = QCheckBox("自动加深（检测偏浅文字并加深，提升清晰度）")
+        self.darken_check.setChecked(True)
+        self.darken_check.setToolTip("启用后，处理完成时检查文字颜色深度；若文字偏浅则自动加深到合适黑度，背景不变。已经足够深的文字不处理。")
+        form.addRow("自动加深:", self.darken_check)
+
         # 主题选择
         self.theme_combo = QComboBox()
         self.theme_combo.addItem("浅色界面")
@@ -1822,6 +1884,7 @@ class BlackCircleRemoverPage(QWidget):
         dpi = self.dpi_spin.value()
         edge_cover = self.edge_cover_check.isChecked()
         edge_margin = self.edge_margin_spin.value()
+        auto_darken = self.darken_check.isChecked()
 
         self.log("=" * 60)
         self.log(f"开始处理目录: {input_dir}")
@@ -1832,6 +1895,7 @@ class BlackCircleRemoverPage(QWidget):
         self.log(f"边缘覆盖: {'开启' if edge_cover else '关闭'}")
         if edge_cover:
             self.log(f"边缘覆盖边距: {edge_margin}mm")
+        self.log(f"自动加深: {'开启' if auto_darken else '关闭'}")
         self.log(f"DPI: {dpi}")
         thread_count = self.thread_spin.value()
         self.log(f"并行线程: {thread_count}")
@@ -1842,7 +1906,7 @@ class BlackCircleRemoverPage(QWidget):
                                             deskew=deskew, remove_border=remove_border,
                                             thread_count=thread_count,
                                             edge_cover=edge_cover, edge_margin_mm=edge_margin,
-                                            dpi=dpi)
+                                            dpi=dpi, auto_darken=auto_darken)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.result_signal.connect(self.display_results)
