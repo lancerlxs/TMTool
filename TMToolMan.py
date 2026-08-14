@@ -7,6 +7,7 @@
 #
 # ```python
 import sys
+import re
 import os
 import shutil
 # 使用 PyQt5（Qt5）替代 PySide6（Qt6），以兼容 Python 3.8。
@@ -30,12 +31,12 @@ from pathlib import Path
 
 
 class TechStyle:
-    """科技感样式表"""
-    MAIN_BG = "#0B0F19"
-    PANEL_BG = "#161B22"
-    TEXT_COLOR = "#E0E0E0"
-    ACCENT_COLOR = "#00F0FF"
-    BTN_HOVER = "#1F6FEB"
+    """浅色页面样式表(参照 ImageCheckTool 浅色风格)"""
+    MAIN_BG = "#ecf0f1"
+    PANEL_BG = "#ffffff"
+    TEXT_COLOR = "#2c3e50"
+    ACCENT_COLOR = "#1a5276"
+    BTN_HOVER = "#2980b9"
 
     QSS = f"""
     QMainWindow {{ background-color: {MAIN_BG}; }}
@@ -44,30 +45,30 @@ class TechStyle:
     /* 左侧菜单栏 */
     #LeftPanel {{
         background-color: {PANEL_BG};
-        border-right: 1px solid #30363D;
+        border-right: 1px solid #bdc3c7;
     }}
     QLabel#TitleLabel {{
         color: {ACCENT_COLOR};
         font-size: 18px;
         font-weight: bold;
         padding: 20px;
-        border-bottom: 1px solid #30363D;
+        border-bottom: 1px solid #bdc3c7;
     }}
     QPushButton#MenuBtn {{
         background-color: transparent;
-        color: #8B949E;
+        color: #7f8c8d;
         text-align: left;
         padding: 15px 20px;
         border: none;
         font-size: 14px;
     }}
     QPushButton#MenuBtn:hover {{
-        background-color: #21262D;
+        background-color: #d6eaf8;
         color: {ACCENT_COLOR};
         border-left: 2px solid {ACCENT_COLOR};
     }}
     QPushButton#MenuBtn:checked {{
-        background-color: #1F242C;
+        background-color: #aed6f1;
         color: {ACCENT_COLOR};
         border-left: 4px solid {ACCENT_COLOR};
         font-weight: bold;
@@ -76,7 +77,7 @@ class TechStyle:
     /* 右侧功能区 */
     #RightPanel {{ background-color: {MAIN_BG}; }}
     QGroupBox {{
-        border: 1px solid #30363D;
+        border: 1px solid #bdc3c7;
         border-radius: 5px;
         margin-top: 15px;
         padding: 15px;
@@ -91,8 +92,8 @@ class TechStyle:
 
     /* 输入控件 */
     QLineEdit, QSpinBox, QComboBox {{
-        background-color: #0D1117;
-        border: 1px solid #30363D;
+        background-color: #ffffff;
+        border: 1px solid #bdc3c7;
         border-radius: 3px;
         padding: 5px;
         color: {TEXT_COLOR};
@@ -103,13 +104,13 @@ class TechStyle:
 
     /* QSpinBox 上下按钮：显式定义，避免样式表覆盖后按钮消失/失效 */
     QSpinBox::up-button, QSpinBox::down-button {{
-        background-color: #21262D;
+        background-color: #d6eaf8;
         border: none;
         width: 18px;
     }}
-    QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #30363D; }}
-    QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #30363D; border-top: 1px solid #30363D; }}
-    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #30363D; }}
+    QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #bdc3c7; }}
+    QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #bdc3c7; border-top: 1px solid #bdc3c7; }}
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #2980b9; }}
     QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background-color: {ACCENT_COLOR}; }}
     QSpinBox::up-arrow {{
         image: none;
@@ -139,30 +140,30 @@ class TechStyle:
         background-color: #2EA043;
     }}
     QPushButton#BrowseBtn {{
-        background-color: #30363D;
+        background-color: #2980b9;
         color: white;
         border: none;
         padding: 5px 10px;
         border-radius: 3px;
     }}
     QPushButton#BrowseBtn:hover {{
-        background-color: #3C434D;
+        background-color: #3498db;
     }}
 
     QTextEdit {{
-        background-color: #0D1117;
-        border: 1px solid #30363D;
+        background-color: #ffffff;
+        border: 1px solid #bdc3c7;
         border-radius: 3px;
-        color: #FFFFFF;
+        color: #2c3e50;
         font-size: 13px;
     }}
     
     /* 消息提示框 */
     QMessageBox {{
-        background-color: #FFFFFF;
+        background-color: #ffffff;
     }}
     QMessageBox QLabel {{
-        color: #000000;
+        color: #2c3e50;
         font-weight: bold;
         font-size: 14px;
     }}
@@ -202,6 +203,271 @@ class FunctionPage(QWidget):
 
     def log(self, msg):
         self.log_box.append(f">> {msg}")
+
+
+class FileSplitWorker(QThread):
+    """
+    分件后台处理线程：
+    对所选目录下的每个子目录——
+      1. 取文件名排序后的第1、2页(0001.jpg/0002.jpg)，对第2页 OCR；
+      2. 判断标题是否为“卷内文件目录”；是则解析表格中“序号”“页号”列；
+      3. 按序号建子目录(目录名+“-”+四位序号)，按页号范围移动 jpg 文件
+         (页号+2 = 实际文件名，如页号“1-17”→移动 0003.jpg..0019.jpg)；
+      4. 建“目录名+备考表卷底”“目录名+卷皮目录”两个子目录；
+         0001/0002 移入卷皮目录，最大与次大文件名移入备考表卷底；
+      5. 全程详细日志(OCR识别行、序号/页号解析、文件移动范围)写入所选目录。
+    """
+    log_signal = Signal(str)
+    progress_signal = Signal(int, int)          # (当前, 总数)
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, base_dir, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.is_stopped = False
+        self._ocr = None  # PaddleOCR 延迟初始化(只初始化一次, 避免重复加载模型)
+
+    # ---------- OCR ----------
+    def _get_ocr(self):
+        """延迟初始化 PaddleOCR(中文, 带方向分类)。失败返回 None。"""
+        if self._ocr is None:
+            try:
+                from paddleocr import PaddleOCR
+                self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
+                self._ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
+            except Exception as e:
+                self.log_signal.emit(f"  × PaddleOCR 初始化失败: {e}")
+                return None
+        return self._ocr
+
+    def _ocr_page(self, image_path, logf, wlog):
+        """对单页做 OCR，返回 [(文本, y中心, x0), ...] 按行。"""
+        ocr = self._get_ocr()
+        if ocr is None:
+            return []
+        try:
+            result = ocr.ocr(image_path, cls=True)
+        except Exception as e:
+            wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
+            return []
+        lines = []
+        if result and result[0]:
+            for item in result[0]:
+                box, (txt, conf) = item[0], item[1]
+                x0, y0 = box[0][0], box[0][1]
+                yc = (box[0][1] + box[2][1]) / 2.0
+                lines.append((txt, yc, x0))
+                wlog(f"    OCR行: 「{txt}」 置信度={conf:.2f} 位置=({x0:.0f},{y0:.0f})")
+        # 按行(y中心)聚类排序：同一行(±15px)的片段合并
+        lines.sort(key=lambda t: t[1])
+        rows = []
+        for txt, yc, x0 in lines:
+            if rows and abs(yc - rows[-1][0]) < 15:
+                rows[-1][1].append((x0, txt))
+            else:
+                rows.append([yc, [(x0, txt)]])
+        merged = []
+        for yc, frags in rows:
+            frags.sort(key=lambda f: f[0])  # 行内按 x 排序
+            merged.append(' '.join(f[1] for f in frags))
+        return merged
+
+    # ---------- 表格解析 ----------
+    @staticmethod
+    def _is_catalog_title(rows):
+        """判断 OCR 行中是否含标题“卷内文件目录”。"""
+        for r in rows:
+            compact = r.replace(' ', '').replace('　', '')
+            if '卷内文件目录' in compact:
+                return True
+        return False
+
+    @staticmethod
+    def _parse_catalog_rows(rows, wlog):
+        """
+        解析表格数据行：返回 [(序号int, 起页int, 止页int), ...]。
+        行特征：开头为一位数字(序号)，且行内含 “数字-数字”(页号)。
+        """
+        parsed = []
+        for r in rows:
+            compact = r.replace(' ', '').replace('　', '')
+            if '卷内文件目录' in compact:
+                continue
+            m_seq = re.match(r'^(\d{1})\D', compact + '.')  # 序号: 一位数字开头
+            m_pages = re.search(r'(\d{1,4})\s*[-–—~]\s*(\d{1,4})', r)
+            if not m_seq:
+                continue
+            seq = int(m_seq.group(1))
+            if not m_pages:
+                wlog(f"    跳过行(无页号): 「{r}」")
+                continue
+            p_start, p_end = int(m_pages.group(1)), int(m_pages.group(2))
+            if p_end < p_start:
+                p_start, p_end = p_end, p_start
+            parsed.append((seq, p_start, p_end))
+            wlog(f"    解析行: 序号={seq} 页号={p_start}-{p_end} ← 「{r.strip()}」")
+        return parsed
+
+    # ---------- 文件操作 ----------
+    @staticmethod
+    def _jpg_files_sorted(dir_path):
+        """目录下 jpg 文件按文件名(数字)升序。"""
+        files = [f for f in os.listdir(dir_path)
+                 if f.lower().endswith('.jpg') and os.path.isfile(os.path.join(dir_path, f))]
+        def key(f):
+            stem = os.path.splitext(f)[0]
+            return int(stem) if stem.isdigit() else float('inf')
+        return sorted(files, key=key)
+
+    def _process_one_dir(self, subdir, logf, wlog):
+        """处理单个子目录。返回 (状态字符串, 移动文件数)。"""
+        dir_name = os.path.basename(subdir)
+        jpgs = self._jpg_files_sorted(subdir)
+        if len(jpgs) < 4:
+            wlog(f"  [跳过] {dir_name}: jpg 少于 4 张({len(jpgs)}张), 无法分件")
+            return "跳过(文件不足)", 0
+
+        f1, f2 = jpgs[0], jpgs[1]
+        wlog(f"  卷皮页: {f1}, {f2}; 总文件数: {len(jpgs)}")
+
+        # OCR 第2页
+        rows = self._ocr_page(os.path.join(subdir, f2), logf, wlog)
+        if not rows:
+            wlog(f"  [失败] {dir_name}: 第2页 OCR 无结果")
+            return "失败(OCR无结果)", 0
+
+        # 判断标题
+        if not self._is_catalog_title(rows):
+            wlog(f"  [跳过] {dir_name}: 第2页标题不是「卷内文件目录」")
+            return "跳过(非目录页)", 0
+        wlog(f"  标题确认: 卷内文件目录")
+
+        # 解析表格行
+        entries = self._parse_catalog_rows(rows, wlog)
+        if not entries:
+            wlog(f"  [失败] {dir_name}: 未解析到任何 序号/页号 行")
+            return "失败(未解析到数据)", 0
+
+        # 建序号子目录并移动文件
+        moved = 0
+        for seq, p_start, p_end in entries:
+            sub_name = f"{dir_name}-{seq:04d}"
+            sub_path = os.path.join(subdir, sub_name)
+            os.makedirs(sub_path, exist_ok=True)
+            # 页号+2 = 文件名: 页号1-17 → 0003.jpg..0019.jpg
+            for n in range(p_start + 2, p_end + 3):
+                fname = f"{n:04d}.jpg"
+                src = os.path.join(subdir, fname)
+                if os.path.exists(src):
+                    try:
+                        shutil.move(src, os.path.join(sub_path, fname))
+                        moved += 1
+                    except Exception as e:
+                        wlog(f"    × 移动失败 {fname}: {e}")
+                else:
+                    wlog(f"    (缺) {fname} 不存在, 跳过")
+            wlog(f"  序号{seq}: 页号{p_start}-{p_end} → {sub_name}/ "
+                 f"移动 {fname if False else f'{p_start + 2:04d}.jpg..{p_end + 2:04d}.jpg'}")
+
+        # 建备考表卷底 / 卷皮目录
+        path_beikao = os.path.join(subdir, f"{dir_name}备考表卷底")
+        path_juanpi = os.path.join(subdir, f"{dir_name}卷皮目录")
+        os.makedirs(path_beikao, exist_ok=True)
+        os.makedirs(path_juanpi, exist_ok=True)
+
+        # 0001/0002 → 卷皮目录
+        for fname in (f1, f2):
+            src = os.path.join(subdir, fname)
+            if os.path.exists(src):
+                shutil.move(src, os.path.join(path_juanpi, fname))
+                moved += 1
+        wlog(f"  卷皮: {f1},{f2} → {dir_name}卷皮目录/")
+
+        # 当前剩余文件里 最大与次大 → 备考表卷底
+        remain = self._jpg_files_sorted(subdir)
+        if len(remain) >= 2:
+            for fname in (remain[-1], remain[-2]):
+                src = os.path.join(subdir, fname)
+                shutil.move(src, os.path.join(path_beikao, fname))
+                moved += 1
+            wlog(f"  备考: {remain[-2]},{remain[-1]} → {dir_name}备考表卷底/")
+        else:
+            wlog(f"  备考: 剩余文件不足2张({len(remain)}), 未移动")
+
+        return f"完成({len(entries)}件,移动{moved}个文件)", moved
+
+    def run(self):
+        try:
+            if not os.path.isdir(self.base_dir):
+                self.finished_signal.emit(False, "所选目录不存在")
+                return
+
+            # 日志文件放在用户所选目录下
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_path = os.path.join(self.base_dir, f"分件处理日志_{ts}.txt")
+            logf = open(log_path, 'w', encoding='utf-8')
+            lock = __import__('threading').Lock()
+
+            def wlog(s):
+                with lock:
+                    logf.write(s + "\n")
+                    logf.flush()
+                self.log_signal.emit(s)
+
+            wlog("分件处理日志")
+            wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"所选目录: {self.base_dir}")
+            wlog("=" * 70)
+
+            subdirs = sorted([os.path.join(self.base_dir, d)
+                              for d in os.listdir(self.base_dir)
+                              if os.path.isdir(os.path.join(self.base_dir, d))])
+            total = len(subdirs)
+            if total == 0:
+                logf.close()
+                self.finished_signal.emit(False, "所选目录下没有子目录")
+                return
+
+            wlog(f"共发现 {total} 个子目录待处理")
+            done = 0
+            moved_total = 0
+            for subdir in subdirs:
+                if self.is_stopped:
+                    wlog("用户停止处理")
+                    break
+                wlog("")
+                wlog(f"[{done + 1}/{total}] 处理: {os.path.basename(subdir)}")
+                wlog("-" * 50)
+                try:
+                    status, moved = self._process_one_dir(subdir, logf, wlog)
+                    moved_total += moved
+                    wlog(f"  结果: {status}")
+                except Exception as e:
+                    import traceback
+                    wlog(f"  [异常] {e}")
+                    wlog(traceback.format_exc())
+                done += 1
+                self.progress_signal.emit(done, total)
+
+            wlog("")
+            wlog("=" * 70)
+            wlog(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"总计: 处理 {done}/{total} 个子目录, 移动文件 {moved_total} 个")
+            if self.is_stopped:
+                wlog("注意: 处理被用户中途停止")
+            logf.close()
+
+            msg = (f"分件完成！处理 {done}/{total} 个子目录，移动 {moved_total} 个文件。\n"
+                   f"日志: {os.path.basename(log_path)}")
+            self.finished_signal.emit(not self.is_stopped, msg)
+
+        except Exception as e:
+            import traceback
+            self.log_signal.emit(traceback.format_exc())
+            self.finished_signal.emit(False, f"处理出错: {e}")
+
+    def stop(self):
+        self.is_stopped = True
 
 
 class FileRenameWorker(QThread):
@@ -445,6 +711,11 @@ class FileRenamePage(FunctionPage):
         self.worker = None
         self.add_log_widget()
 
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+
     def browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择目录")
         if d: self.dir_path.setText(d)
@@ -532,6 +803,10 @@ class FileRenamePage(FunctionPage):
         if reply != QMessageBox.Yes:
             return
         
+        # 重置进度条
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中...")
+        
         # 禁用按钮，启用停止按钮
         self.log("="*50)
         self.log("开始处理...")
@@ -566,11 +841,14 @@ class FileRenamePage(FunctionPage):
     def update_progress(self, current, total):
         """更新进度显示"""
         percentage = (current / total) * 100 if total > 0 else 0
+        self.progress.setValue(int(percentage))
+        self.progress.setFormat(f"{current} / {total}  ({percentage:.0f}%)")
         self.log(f"进度: {current}/{total} ({percentage:.1f}%)")
     
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止")
         
         # 恢复按钮状态
         btn = self.findChild(QPushButton, "ActionBtn")
@@ -860,6 +1138,11 @@ class AutoPagingPage(FunctionPage):
         self.stop_btn.setEnabled(False)
         self.layout.addWidget(self.stop_btn)
         
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+        
         self.worker = None
         self.add_log_widget()
 
@@ -872,6 +1155,10 @@ class AutoPagingPage(FunctionPage):
         if not os.path.exists(d):
             QMessageBox.warning(self, "错误", "指定的目录不存在")
             return
+        
+        # 重置进度条
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中...")
         
         # 禁用按钮，启用停止按钮
         self.log("="*50)
@@ -914,11 +1201,14 @@ class AutoPagingPage(FunctionPage):
     def update_progress(self, current, total):
         """更新进度显示"""
         percentage = (current / total) * 100 if total > 0 else 0
+        self.progress.setValue(int(percentage))
+        self.progress.setFormat(f"{current} / {total}  ({percentage:.0f}%)")
         self.log(f"进度: {current}/{total} ({percentage:.1f}%)")
     
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止")
         
         # 恢复按钮状态
         btn = self.findChild(QPushButton, "ActionBtn")
@@ -1327,6 +1617,11 @@ class ArchiveStampPage(FunctionPage):
         
         self.layout.addLayout(btn_layout)
         
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+        
         self.worker = None
         self.add_log_widget()
     
@@ -1416,6 +1711,10 @@ class ArchiveStampPage(FunctionPage):
         if reply != QMessageBox.Yes:
             return
         
+        # 重置进度条
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中...")
+        
         # 禁用按钮，启用停止按钮
         self.log("="*50)
         self.log("开始处理...")
@@ -1458,11 +1757,14 @@ class ArchiveStampPage(FunctionPage):
     def update_progress(self, current, total):
         """更新进度显示"""
         percentage = (current / total) * 100 if total > 0 else 0
+        self.progress.setValue(int(percentage))
+        self.progress.setFormat(f"{current} / {total}  ({percentage:.0f}%)")
         self.log(f"进度: {current}/{total} ({percentage:.1f}%)")
     
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止")
         
         # 恢复按钮状态
         btn = self.findChild(QPushButton, "ActionBtn")
@@ -1860,16 +2162,21 @@ class JpgToPdfWorker(QThread):
         self.resolution = resolution
         self.generate_ofd = generate_ofd  # 是否同时生成OFD文件
         self.is_stopped = False
+        import threading
+        self._ofd_lock = threading.Lock()
         
-        # 检查Spire.PDF库是否可用（用于生成OFD）
+        # 检查 OFD 转换库是否可用（用于生成双层OFD）
+        # 使用自建 ofd_writer（基于 PyMuPDF，生成图像层+文本层的双层OFD，
+        # 无页数限制）。旧的 Spire.PDF 免费版只能转前 3 页，已弃用。
         if self.generate_ofd:
             try:
-                from spire.pdf import PdfDocument, FileFormat
-                self.spire_available = True
+                import fitz  # noqa: F401  PyMuPDF
+                from ofd_writer import make_layered_ofd  # noqa: F401
+                self.ofd_available = True
             except ImportError:
-                self.spire_available = False
+                self.ofd_available = False
         else:
-            self.spire_available = False
+            self.ofd_available = False
     
     def run(self):
         try:
@@ -2059,40 +2366,34 @@ class JpgToPdfWorker(QThread):
                 os.remove(temp_pdf_path)
     
     def convert_pdf_to_ofd(self, pdf_path, ofd_path):
-        """使用Spire.PDF库将PDF转换为OFD格式"""
+        """使用 ofd_writer 将双层PDF转换为双层OFD(图像层+文本层，无页数限制)。"""
         if not os.path.exists(pdf_path):
             return False, 0
-        
-        if not self.spire_available:
+
+        if not self.ofd_available:
             return False, 0
-        
+
         start_time = time.time()
-        
+
         try:
-            from spire.pdf import PdfDocument, FileFormat
-            
-            # 创建PdfDocument实例
-            pdf_document = PdfDocument()
-            
-            # 加载PDF文件
-            pdf_document.LoadFromFile(pdf_path)
-            
-            # 保存为OFD格式
-            pdf_document.SaveToFile(ofd_path, FileFormat.OFD)
-            
-            # 清理资源
-            pdf_document.Close()
-            
+            from ofd_writer import make_layered_ofd
+
+            # 加锁串行转换（PyMuPDF 在 Win7 多线程下更稳妥）
+            with self._ofd_lock:
+                ok, n, err = make_layered_ofd(pdf_path, ofd_path)
+
+            if not ok:
+                print(f"PDF转OFD失败: {err}")
+                return False, time.time() - start_time
+
             end_time = time.time()
-            duration = end_time - start_time
-            return True, duration
-            
+            return True, end_time - start_time
+
         except Exception as e:
             end_time = time.time()
-            duration = end_time - start_time
             print(f"PDF转OFD过程中发生错误: {e}")
-            return False, duration
-    
+            return False, end_time - start_time
+
     def process_single_directory(self, jpg_files, dir_name):
         """处理单个目录的JPG文件"""
         start_time = time.time()
@@ -2111,7 +2412,7 @@ class JpgToPdfWorker(QThread):
                 result = "成功"
                 
                 # 如果选择了生成OFD，则转换刚生成的PDF
-                if self.generate_ofd and self.spire_available and result_pdf_path:
+                if self.generate_ofd and self.ofd_available and result_pdf_path:
                     ofd_path = os.path.splitext(result_pdf_path)[0] + '.ofd'
                     ofd_success, ofd_duration = self.convert_pdf_to_ofd(result_pdf_path, ofd_path)
                     if ofd_success:
@@ -2256,6 +2557,11 @@ class JpgToPdfPage(FunctionPage):
         
         self.layout.addLayout(btn_layout)
         
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+        
         self.worker = None
         self.add_log_widget()
     
@@ -2356,6 +2662,10 @@ class JpgToPdfPage(FunctionPage):
         if reply != QMessageBox.Yes:
             return
         
+        # 重置进度条
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中...")
+        
         # 禁用按钮，启用停止按钮
         self.log("="*50)
         self.log("开始处理...")
@@ -2399,11 +2709,14 @@ class JpgToPdfPage(FunctionPage):
     def update_progress(self, current, total):
         """更新进度显示"""
         percentage = (current / total) * 100 if total > 0 else 0
+        self.progress.setValue(int(percentage))
+        self.progress.setFormat(f"{current} / {total}  ({percentage:.0f}%)")
         self.log(f"进度: {current}/{total} ({percentage:.1f}%)")
     
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止")
         
         # 恢复按钮状态
         btn = self.findChild(QPushButton, "ActionBtn")
@@ -2428,18 +2741,21 @@ class PdfToOfdWorker(QThread):
         self.pdf_dir = pdf_dir
         self.output_dir = output_dir
         self.is_stopped = False
-        
-        # 检查Spire.PDF库是否可用
+        import threading
+        self._ofd_lock = threading.Lock()
+
+        # 检查 OFD 转换库是否可用（ofd_writer，基于 PyMuPDF，生成双层OFD）
         try:
-            from spire.pdf import PdfDocument, FileFormat
-            self.spire_available = True
+            import fitz  # noqa: F401
+            from ofd_writer import make_layered_ofd  # noqa: F401
+            self.ofd_available = True
         except ImportError:
-            self.spire_available = False
-    
+            self.ofd_available = False
+
     def run(self):
         try:
-            if not self.spire_available:
-                self.finished_signal.emit(False, "错误：未安装Spire.PDF库\n请运行: pip install Spire.Pdf")
+            if not self.ofd_available:
+                self.finished_signal.emit(False, "错误：未安装 OFD 转换依赖(PyMuPDF)\n请运行: pip install PyMuPDF")
                 return
             
             # 获取所有PDF文件
@@ -2459,7 +2775,7 @@ class PdfToOfdWorker(QThread):
             
             # 创建日志文件
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_filename = f"spire_conversion_log_{timestamp}.txt"
+            log_filename = f"ofd_conversion_log_{timestamp}.txt"
             log_file_path = os.path.join(self.pdf_dir, log_filename)
             start_time = datetime.now()
             log_entries = []
@@ -2514,7 +2830,7 @@ class PdfToOfdWorker(QThread):
                 total_duration = (end_time - start_time).total_seconds() / 60
                 
                 with open(log_file_path, 'w', encoding='utf-8') as log_file:
-                    log_file.write("PDF转OFD处理日志 (Spire.PDF)\n")
+                    log_file.write("PDF转OFD处理日志 (双层OFD)\n")
                     log_file.write("=" * 50 + "\n")
                     log_file.write(f"处理开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                     log_file.write(f"处理结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -2543,45 +2859,38 @@ class PdfToOfdWorker(QThread):
         self.is_stopped = True
     
     def convert_pdf_to_ofd(self, pdf_path, ofd_path):
-        """使用Spire.PDF库将PDF转换为OFD格式"""
+        """使用 ofd_writer 将双层PDF转换为双层OFD(图像层+文本层，无页数限制)。"""
         if not os.path.exists(pdf_path):
             return False, 0
-        
-        if not self.spire_available:
+
+        if not self.ofd_available:
             return False, 0
-        
+
         start_time = time.time()
-        
+
         try:
-            from spire.pdf import PdfDocument, FileFormat
-            
-            # 创建PdfDocument实例
-            pdf_document = PdfDocument()
-            
-            # 加载PDF文件
-            pdf_document.LoadFromFile(pdf_path)
-            
-            # 保存为OFD格式
-            pdf_document.SaveToFile(ofd_path, FileFormat.OFD)
-            
-            # 清理资源
-            pdf_document.Close()
-            
+            from ofd_writer import make_layered_ofd
+
+            with self._ofd_lock:
+                ok, n, err = make_layered_ofd(pdf_path, ofd_path)
+
+            if not ok:
+                print(f"文件转换失败: {err}")
+                return False, time.time() - start_time
+
             end_time = time.time()
-            duration = end_time - start_time
-            return True, duration
-            
+            return True, end_time - start_time
+
         except Exception as e:
             end_time = time.time()
-            duration = end_time - start_time
             print(f"文件转换过程中发生错误: {e}")
-            return False, duration
+            return False, end_time - start_time
 
 
 class PdfToOfdPage(FunctionPage):
     def __init__(self):
         super().__init__("PDF转OFD")
-        group = QGroupBox("PDF转OFD格式 (Spire.PDF)")
+        group = QGroupBox("PDF转OFD格式 (双层OFD)")
         form = QFormLayout()
 
         self.pdf_dir = QLineEdit()
@@ -2608,11 +2917,11 @@ class PdfToOfdPage(FunctionPage):
         # 说明文本
         info_label = QLabel(
             "功能说明：\n"
-            "• 使用Spire.PDF库进行高质量转换\n"
+            "• 生成双层OFD（图像层+可检索文本层），完整转换全部页，无页数限制\n"
             "• 支持递归扫描子目录\n"
             "• 保持原有目录结构\n"
             "• OFD文件名与PDF相同\n"
-            "• 注意：需要先安装Spire.PDF库"
+            "• 注意：需要 OFD 转换依赖 PyMuPDF (已随程序内置)"
         )
         info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
         self.layout.addWidget(info_label)
@@ -2639,6 +2948,11 @@ class PdfToOfdPage(FunctionPage):
         btn_layout.addWidget(self.stop_btn)
         
         self.layout.addLayout(btn_layout)
+        
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
         
         self.worker = None
         self.add_log_widget()
@@ -2698,7 +3012,7 @@ class PdfToOfdPage(FunctionPage):
             
             self.log("")
             self.log("注意：这只是预览，文件尚未转换。")
-            self.log("注意：需要先安装Spire.PDF库！")
+            self.log("注意：需要 OFD 转换依赖 PyMuPDF！")
             
         except Exception as e:
             error_msg = f"预览过程中出现错误: {str(e)}"
@@ -2728,13 +3042,17 @@ class PdfToOfdPage(FunctionPage):
         # 确认操作
         reply = QMessageBox.question(
             self, "确认操作",
-            "确定要开始转换吗？\n\n注意：需要先安装Spire.PDF库！",
+            "确定要开始转换吗？\n\n注意：需要 OFD 转换依赖 PyMuPDF！",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
         if reply != QMessageBox.Yes:
             return
+        
+        # 重置进度条
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中...")
         
         # 禁用按钮，启用停止按钮
         self.log("="*50)
@@ -2771,11 +3089,14 @@ class PdfToOfdPage(FunctionPage):
     def update_progress(self, current, total):
         """更新进度显示"""
         percentage = (current / total) * 100 if total > 0 else 0
+        self.progress.setValue(int(percentage))
+        self.progress.setFormat(f"{current} / {total}  ({percentage:.0f}%)")
         self.log(f"进度: {current}/{total} ({percentage:.1f}%)")
     
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止")
         
         # 恢复按钮状态
         btn = self.findChild(QPushButton, "ActionBtn")
@@ -2787,6 +3108,123 @@ class PdfToOfdPage(FunctionPage):
             QMessageBox.information(self, "完成", "处理完成！")
         else:
             QMessageBox.warning(self, "提示", message)
+
+
+class FileSplitPage(FunctionPage):
+    """分件功能页：按卷内文件目录表格自动分件"""
+
+    def __init__(self):
+        super().__init__("分件")
+        group = QGroupBox("分件 (按卷内文件目录表格自动拆分)")
+        form = QFormLayout()
+
+        self.dir_edit = QLineEdit()
+        self.dir_edit.setPlaceholderText("选择要分件的目录(将处理其下所有子目录)")
+        btn_browse = QPushButton("选择文件夹")
+        btn_browse.setObjectName("BrowseBtn")
+        btn_browse.clicked.connect(self.browse_dir)
+        h = QHBoxLayout()
+        h.addWidget(self.dir_edit)
+        h.addWidget(btn_browse)
+        form.addRow("分件目录:", h)
+
+        group.setLayout(form)
+        self.layout.addWidget(group)
+
+        # 说明
+        info = QLabel(
+            "功能说明：\n"
+            "• 对所选目录下每个子目录：取 0001/0002 两页，OCR 第2页\n"
+            "• 第2页标题为「卷内文件目录」时，解析序号、页号列(如 1-17)\n"
+            "• 按序号建子目录(目录名-0001)，页号+2 为文件名移动对应 jpg\n"
+            "• 建「目录名+备考表卷底」「目录名+卷皮目录」两个子目录\n"
+            "• 0001/0002 → 卷皮目录；最大与次大文件 → 备考表卷底\n"
+            "• 详细日志保存在所选目录下"
+        )
+        info.setStyleSheet("color: #666; font-size: 12px;")
+        self.layout.addWidget(info)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("开始分件")
+        self.start_btn.setObjectName("ActionBtn")
+        self.start_btn.clicked.connect(self.start)
+        btn_layout.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("ActionBtn")
+        self.stop_btn.setStyleSheet("background-color: #DA3633; color: white;")
+        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+        self.layout.addLayout(btn_layout)
+
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+
+        # 日志
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMinimumHeight(250)
+        self.layout.addWidget(self.log_box, 1)
+
+        self.worker = None
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择分件目录")
+        if d:
+            self.dir_edit.setText(d)
+
+    def log(self, msg):
+        self.log_box.append(f">> {msg}")
+
+    def start(self):
+        base_dir = self.dir_edit.text().strip()
+        if not base_dir:
+            QMessageBox.warning(self, "提示", "请先选择分件目录")
+            return
+        if not os.path.isdir(base_dir):
+            QMessageBox.warning(self, "错误", "目录不存在")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认操作",
+            "分件将移动所选目录下的 jpg 文件(不可自动撤销)，\n"
+            "建议先备份。确定开始吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.log_box.clear()
+        self.log(f"开始分件: {base_dir}")
+        self.worker = FileSplitWorker(base_dir)
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.finished_signal.connect(self.on_finished)
+        self.worker.start()
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def stop(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.log("正在停止...")
+
+    def update_progress(self, cur, total):
+        pct = cur / total * 100 if total else 0
+        self.progress.setValue(int(pct))
+        self.progress.setFormat(f"{cur} / {total} ({pct:.0f}%)")
+
+    def on_finished(self, success, message):
+        self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止/失败")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if success:
+            QMessageBox.information(self, "完成", message)
+        else:
+            QMessageBox.warning(self, "结束", message)
 
 
 class SettingsPage(FunctionPage):
@@ -2856,7 +3294,7 @@ class MainWindow(QMainWindow):
 
         # 菜单按钮配置 (去除了重复的"文件改名")
         menus = ["文件改名", "自动编页码", "文件移动", "加盖归档章",
-                 "修改DPI", "JPG转双层PDF", "PDF转OFD", "参数设置"]
+                 "修改DPI", "JPG转双层PDF", "PDF转OFD", "分件", "参数设置"]
 
         self.menu_buttons = []
         for m in menus:
@@ -2886,6 +3324,7 @@ class MainWindow(QMainWindow):
             "修改DPI": ModifyDpiPage(),
             "JPG转双层PDF": JpgToPdfPage(),
             "PDF转OFD": PdfToOfdPage(),
+            "分件": FileSplitPage(),
             "参数设置": SettingsPage()
         }
 
