@@ -352,6 +352,11 @@ class CircleDetectionWorker(QThread):
             img.load()  # 立即解码，及时暴露损坏文件
             if img.mode not in ('RGB', 'L'):
                 img = img.convert('RGB')
+            # 记录原图 DPI，处理过程中 fromarray/rotate 会丢失 DPI 元数据，
+            # 保存时需写回，确保输出保持原图分辨率(通常 300DPI)。
+            orig_dpi = img.info.get('dpi')
+            if not orig_dpi:
+                orig_dpi = (float(self.dpi_assumption), float(self.dpi_assumption))
             # 可选：纠偏(去倾斜)——纯旋转，内容不变形；之后再做圆洞检测
             deskew_applied = 0.0
             if self.deskew:
@@ -398,10 +403,10 @@ class CircleDetectionWorker(QThread):
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             if circles_info:
-                img.save(output_path, quality=95)
+                img.save(output_path, quality=95, dpi=orig_dpi)
             else:
                 # 未检测到圆洞：检查去黑边是否改了图
-                img.save(output_path, quality=95)
+                img.save(output_path, quality=95, dpi=orig_dpi)
 
             return {
                 'path': image_path,
