@@ -16,7 +16,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QStackedWidget, QCheckBox,
-                             QProgressBar)
+                             QProgressBar, QDialog, QListWidget, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QAbstractItemView)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QRegularExpression
 from PyQt5.QtGui import QFont, QRegularExpressionValidator
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -56,21 +57,22 @@ class TechStyle:
     }}
     QPushButton#MenuBtn {{
         background-color: transparent;
-        color: #7f8c8d;
+        color: #1a5276;
         text-align: left;
-        padding: 15px 20px;
+        padding: 16px 20px;
         border: none;
-        font-size: 14px;
+        font-size: 17px;
+        font-weight: bold;
     }}
     QPushButton#MenuBtn:hover {{
         background-color: #d6eaf8;
-        color: {ACCENT_COLOR};
-        border-left: 2px solid {ACCENT_COLOR};
+        color: #154360;
+        border-left: 4px solid {ACCENT_COLOR};
     }}
     QPushButton#MenuBtn:checked {{
         background-color: #aed6f1;
-        color: {ACCENT_COLOR};
-        border-left: 4px solid {ACCENT_COLOR};
+        color: #0e2f44;
+        border-left: 5px solid {ACCENT_COLOR};
         font-weight: bold;
     }}
 
@@ -221,91 +223,643 @@ class FileSplitWorker(QThread):
     progress_signal = Signal(int, int)          # (当前, 总数)
     finished_signal = Signal(bool, str)
 
-    def __init__(self, base_dir, parent=None):
+    def __init__(self, base_dir, target_base=None, copy_mode=False, parent=None):
         super().__init__(parent)
         self.base_dir = base_dir
+        self.target_base = target_base    # 分件到新目录: 输出根目录(None=原地)
+        self.copy_mode = copy_mode        # True=文件拷贝(源不动), False=移动
         self.is_stopped = False
         self._ocr = None  # PaddleOCR 延迟初始化(只初始化一次, 避免重复加载模型)
 
     # ---------- OCR ----------
     def _get_ocr(self):
-        """延迟初始化 PaddleOCR(中文, 带方向分类)。失败返回 None。"""
+        """
+        延迟初始化 PaddleOCR(中文, 带方向分类)。失败返回 None。
+        模型文件随程序打包(ocr_models/)，显式指定路径，避免在用户机器上
+        联网下载模型(内网环境会静默失败导致 OCR 无结果)。
+        """
         if self._ocr is None:
             try:
                 from paddleocr import PaddleOCR
                 self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
-                self._ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
+                # 模型目录定位: PyInstaller 打包后资源在 sys._MEIPASS; 开发环境在脚本目录
+                base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+                m_det = os.path.join(base, 'ocr_models', 'det')
+                m_rec = os.path.join(base, 'ocr_models', 'rec')
+                m_cls = os.path.join(base, 'ocr_models', 'cls')
+                has_models = all(os.path.exists(os.path.join(m, 'inference.pdmodel'))
+                                 for m in (m_det, m_rec, m_cls))
+                import warnings as _w
+                _w.filterwarnings('ignore', message='.*use_angle_cls.*deprecated.*')
+                # paddleocr 版本碎片化兼容: 依次尝试多组配置, 成功即用。
+                # 覆盖: 2.x(全参数) / 3.x legacy(use_angle_cls 可用但 show_log 移除)
+                #       / 3.x 新参数(仅无内置模型时; 会走联网下载, 内网可能失败)
+                configs = []
+                if has_models:
+                    configs += [
+                        # 2.x 标准配置
+                        dict(use_angle_cls=True, lang='ch', show_log=False,
+                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
+                        # 3.x legacy: use_angle_cls 被兼容, 但 show_log 已移除
+                        dict(use_angle_cls=True, lang='ch',
+                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
+                        # 3.x 新参数 + 旧模型路径(部分版本参数改名但模型格式仍兼容)
+                        dict(use_textline_orientation=True, lang='ch',
+                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
+                    ]
+                configs += [
+                    dict(use_angle_cls=True, lang='ch', show_log=False),
+                    dict(use_angle_cls=True, lang='ch'),
+                    dict(use_textline_orientation=True),
+                    dict(),
+                ]
+                last_err = None
+                for i, kw in enumerate(configs, 1):
+                    try:
+                        self._ocr = PaddleOCR(**kw)
+                        self.log_signal.emit(f"  (OCR初始化成功: 配置#{i}"
+                                             f"{' 含内置模型' if 'det_model_dir' in kw else ''})")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        self.log_signal.emit(f"  (配置#{i} 不适用: {str(e)[:80]}, 尝试下一配置)")
+                if self._ocr is None:
+                    raise last_err or RuntimeError('所有OCR配置均失败')
             except Exception as e:
                 self.log_signal.emit(f"  × PaddleOCR 初始化失败: {e}")
                 return None
         return self._ocr
 
     def _ocr_page(self, image_path, logf, wlog):
-        """对单页做 OCR，返回 [(文本, y中心, x0), ...] 按行。"""
+        """
+        对单页做 OCR，返回片段列表 [(文本, x0, y0, x1), ...]。
+        x1 为片段右边界，用于列定位。
+        兼容 paddleocr 2.x (ocr(img, cls=True)) 与 3.x (predict(img), 结果对象)。
+        """
         ocr = self._get_ocr()
         if ocr is None:
             return []
+        result = None
         try:
             result = ocr.ocr(image_path, cls=True)
         except Exception as e:
-            wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
-            return []
-        lines = []
-        if result and result[0]:
-            for item in result[0]:
-                box, (txt, conf) = item[0], item[1]
-                x0, y0 = box[0][0], box[0][1]
-                yc = (box[0][1] + box[2][1]) / 2.0
-                lines.append((txt, yc, x0))
-                wlog(f"    OCR行: 「{txt}」 置信度={conf:.2f} 位置=({x0:.0f},{y0:.0f})")
-        # 按行(y中心)聚类排序：同一行(±15px)的片段合并
-        lines.sort(key=lambda t: t[1])
-        rows = []
-        for txt, yc, x0 in lines:
-            if rows and abs(yc - rows[-1][0]) < 15:
-                rows[-1][1].append((x0, txt))
-            else:
-                rows.append([yc, [(x0, txt)]])
-        merged = []
-        for yc, frags in rows:
-            frags.sort(key=lambda f: f[0])  # 行内按 x 排序
-            merged.append(' '.join(f[1] for f in frags))
-        return merged
+            # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
+            try:
+                result = ocr.ocr(image_path)
+            except Exception:
+                try:
+                    result = ocr.predict(image_path)
+                except Exception:
+                    import traceback
+                    wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
+                    wlog("    详细: " + traceback.format_exc().replace('\n', ' | ')[:500])
+                    return []
+
+        frags = []
+        items = []
+        if result:
+            first = result[0]
+            if first is not None and hasattr(first, 'rec_texts'):
+                # 3.x 结果对象: rec_texts/rec_scores/dt_polys
+                texts = list(getattr(first, 'rec_texts', []) or [])
+                scores = list(getattr(first, 'rec_scores', []) or [])
+                polys = list(getattr(first, 'dt_polys', []) or [])
+                for i, txt in enumerate(texts):
+                    poly = polys[i] if i < len(polys) and len(polys[i]) >= 4 else None
+                    if poly is not None:
+                        xs = [p[0] for p in poly]
+                        ys = [p[1] for p in poly]
+                        box = [[min(xs), min(ys)], [max(xs), max(ys)]]
+                    else:
+                        box = [[0, 0], [0, 0]]
+                    conf = scores[i] if i < len(scores) else 0.0
+                    items.append((box, txt, conf))
+            elif first:
+                # 2.x: [[box, (txt, conf)], ...] box为四点多边形
+                # (左上/右上/右下/左下) → 统一转为 [左上,右下] 两点,
+                # 使 y1-y0 为真实行高(box[1]右上的y≈box[0]左上的y)
+                for item in first:
+                    try:
+                        box, (txt, conf) = item[0], item[1]
+                        if len(box) >= 4:
+                            xs = [p[0] for p in box]
+                            ys = [p[1] for p in box]
+                            box = [[min(xs), min(ys)], [max(xs), max(ys)]]
+                        items.append((box, txt, conf))
+                    except Exception:
+                        continue
+        if not items:
+            shape = 'result为空' if not result else ('result[0]为None' if result[0] is None
+                                                     else '结果无内容')
+            wlog(f"    OCR 无内容({shape}): {os.path.basename(image_path)}")
+            return frags
+        for box, txt, conf in items:
+            x0, y0 = box[0][0], box[0][1]
+            x1, y1 = box[1][0], box[1][1]
+            frags.append((txt, x0, y0, x1, y1))
+            wlog(f"    OCR行: 「{txt}」 置信度={conf:.2f} 位置=({x0:.0f},{y0:.0f})")
+        return frags
 
     # ---------- 表格解析 ----------
     @staticmethod
-    def _is_catalog_title(rows):
-        """判断 OCR 行中是否含标题“卷内文件目录”。"""
-        for r in rows:
-            compact = r.replace(' ', '').replace('　', '')
-            if '卷内文件目录' in compact:
-                return True
-        return False
+    def _row_of(frags, y, tol=35):
+        """取与 y 同一行的片段(按 y 中心, 容差 tol)。"""
+        out = []
+        for txt, x0, y0, x1, _y1 in frags:
+            yc = y0  # y0 即片段顶(近似行位置)
+            if abs(yc - y) <= tol:
+                out.append((txt, x0, x1))
+        return out
 
     @staticmethod
-    def _parse_catalog_rows(rows, wlog):
+    def _is_catalog_title(frags):
+        """
+        判断 OCR 片段中是否含标题「卷内文件目录」。
+        匹配策略(由严到宽):
+          1. 完整包含「卷内文件目录」;
+          2. 同一片段同时含「卷内」和「目录」(允许中间夹杂其他字);
+          3. 页面顶部(y最小)的大片段含「目录」且含「卷」——标题被OCR拆散/夹字时的兜底。
+        """
+        for txt, x0, y0, x1, _y1 in frags:
+            compact = txt.replace(' ', '').replace('　', '')
+            if '卷内文件目录' in compact:
+                return True
+            if '卷内' in compact and '目录' in compact:
+                return True
+        # 兜底: 顶部区域(y < 600)内, 「卷」和「目录」分别出现在不同片段
+        has_juan = any('卷' in t.replace(' ', '').replace('　', '') for t, *_ in frags)
+        has_mulu = any('目录' in t.replace(' ', '').replace('　', '') for t, _, y, _, _h in frags if y < 600)
+        return has_juan and has_mulu
+
+    @staticmethod
+    def _parse_catalog_rows(frags, wlog):
         """
         解析表格数据行：返回 [(序号int, 起页int, 止页int), ...]。
-        行特征：开头为一位数字(序号)，且行内含 “数字-数字”(页号)。
+
+        真实档案的两种页号写法(同一表内可混合)：
+          1. 范围式 “1-17” / “146-149”；
+          2. 单数字 “144”  —— 表示该件从该页开始，到下一行起始页-1 止
+             (最后一行则到“下一起始页”未知，保守取同值，即只含该页)。
+        列定位：先找表头“序号”“页号”的 x 坐标确定两列的 x 范围，
+        数据行内按 x 落点取列值(序号列较窄, 页号列在表格最右数据区)。
         """
+        # ---- 1. 定位表头列 x ----
+        seq_x = page_x = None
+        for txt, x0, y0, x1, _y1 in frags:
+            compact = txt.replace(' ', '').replace('　', '')
+            if compact == '序号' and seq_x is None:
+                seq_x = x0
+            elif '页号' in compact and page_x is None:
+                page_x = x0
+        if seq_x is None or page_x is None:
+            wlog("    未找到表头「序号」或「页号」列, 尝试按位置推断列")
+            # 推断: 序号=最左侧数字列, 页号=最右侧数据列(取全图宽)
+            if frags:
+                page_x = 0.62 * max(f[3] for f in frags)
+                seq_x = 0.0
+
+        # ---- 2. 收集数据行: 每行 = (序号候选, 页号原始文本, y) ----
+        # 序号候选: 纯 1-2 位数字片段, x 靠近序号列(x0 < 页号列左界, 且 x0 在序号列附近±180px)
+        seq_tol = 200
+        page_left = page_x - 160  # 页号列数据允许在表头左侧一点
+        candidates = []  # [(seq, y, pagetxt)]
+
+        def _find_pagetxt(y_row):
+            """在该行找页号: 优先独立片段; 否则从长文本尾部提取(OCR 常把日期和
+            页号粘连, 如「...征求意见书及2021.12.2039-143」尾部是页号)。
+            片段起点或右边界落入页号区(x1 >= page_left)即视为含页号。
+            粘连两级处理:
+              a. 日期与页号直接相连无分隔: 「2021.8.30107-111」→日期尾「30」
+                 与页号「107-111」粘连 → 按日期模式(YYYY.M.D)切出页号;
+              b. 页号前是非数字: 「...12.2039-143」→「39-143」(避免吞日期)。"""
+            row = FileSplitWorker._row_of(frags, y_row)
+            best = ''
+            for rt, rx0, rx1 in sorted(row, key=lambda r: r[1]):
+                if rx0 < page_left and rx1 < page_left:
+                    continue  # 片段整体在页号区左侧
+                rt2 = rt.strip()
+                if re.fullmatch(r'\d{1,4}[-–—~]\d{1,4}', rt2):
+                    return rt2
+                if re.fullmatch(r'\d{1,4}', rt2):
+                    best = best or rt2
+                else:
+                    # a. 日期模式紧贴页号: 「2021.8.30107-111」「2021.12.2039-143」
+                    #    日期 YYYY.M.D 的最后一段日期数字与页号起始粘连,
+                    #    页号= 去掉日期前缀后剩下的「数字-数字」
+                    m = re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\s*(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*'
+                                  r'(?:\s+(\d{1,4})\s*)?$', rt2)
+                    if m:
+                        # 可能还有第二个独立页号(如「...112-118」带空格形式)
+                        return f"{m.group(1)}-{m.group(2)}"
+                    # 带空格分隔: 「2021.8.30 112-118」→「112-118」
+                    m = re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\s+(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$', rt2)
+                    if m:
+                        return f"{m.group(1)}-{m.group(2)}"
+                    # b. 页号前是非数字(避免把日期一部分吞进来)
+                    m = re.search(r'(?:^|\D)(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$', rt2)
+                    if m:
+                        return f"{m.group(1)}-{m.group(2)}"
+                    m = re.search(r'(?:^|\s)(\d{1,4})\s*$', rt2)
+                    if m and not best:
+                        best = m.group(1)
+            return best
+
+        for txt, x0, y0, x1, _y1 in frags:
+            t = txt.strip()
+            if not re.fullmatch(r'\d{1,2}', t):
+                continue
+            if x0 > page_left:      # 在页号列右侧的数字 → 页号候选, 不是序号
+                continue
+            if abs(x0 - seq_x) > seq_tol and seq_x > 0:
+                continue
+            candidates.append((int(t), y0, _find_pagetxt(y0)))
+
+        # ---- 2b. 补漏: 有页号但序号未被识别的行(如首行序号「1」漏识别) ----
+        # 找出未被任何 candidate 认领的页号来源(两类) → 按 y 位置插入, 序号推断:
+        #   i.  独立片段: 纯「X-Y」或纯数字(x 在页号区);
+        #   ii. 长文本尾部粘连: 「2021.8.30 112-118」/「2021.8.30107-111」
+        #       (序号与页号都被 OCR 挤进日期长文本的整行, 用同一套粘连提取)
+        used_y = [c[1] for c in candidates]
+        orphan_pages = []  # [(y, pagetxt)]
+
+        def _extract_glued(t):
+            """从长文本尾部提取粘连页号(与 _find_pagetxt 相同的规则, 返回''表示无)。"""
+            m = re.search(r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\s*(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$', t)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}"
+            m = re.search(r'(?:^|\D)(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$', t)
+            if m:
+                return f"{m.group(1)}-{m.group(2)}"
+            m = re.search(r'(?:^|\s)(\d{1,4})\s*$', t)
+            return m.group(1) if m else ''
+
+        for txt, x0, y0, x1, _y1 in frags:
+            t = txt.strip()
+            if x0 < page_left and x1 < page_left:
+                continue  # 整体在页号区左侧, 不含页号
+            if any(abs(y0 - uy) < 40 for uy in used_y):
+                continue  # 已被认领
+            if re.fullmatch(r'\d{1,4}[-–—~]\d{1,4}', t) or re.fullmatch(r'\d{1,4}', t):
+                orphan_pages.append((y0, t))
+            else:
+                # 长文本: 仅当其右边界伸入页号区才尝试提取尾部粘连页号。
+                # 只接受「X-Y」范围形式——单数字从长文本尾部提取误报率高
+                # (容易把日期/字号等数字当页号), 不作为补漏来源。
+                if x1 >= page_left:
+                    glued = _extract_glued(t)
+                    if glued and re.fullmatch(r'\d{1,4}[-–—~]\d{1,4}', glued):
+                        orphan_pages.append((y0, glued))
+        # 孤立页号行统一编号:
+        #   在已认领行之前的 → 按 y 排序后从 (最小已认领序号 - 前置孤立行数)
+        #   开始依次 +1 (例: 已认领最小序号4, 前置孤立3行 → 1,2,3)
+        #   在已认领行之间的 → 前一行序号+1 (同前逻辑)
+        orphan_pages.sort(key=lambda o: o[0])
+        n_before = 0
+        min_seq_known = min((c[0] for c in candidates), default=1)
+        min_y_known = min((c[1] for c in candidates), default=float('inf'))
+        # 统计在已认领行之前的孤立行数
+        lead_orphans = [o for o in orphan_pages if o[0] < min_y_known]
+        n_lead = len(lead_orphans)
+        assigned_lead = 0
+        for y0, t in orphan_pages:
+            if not candidates:
+                nxt_seq = 1 + assigned_lead
+                assigned_lead += 1
+            elif y0 < min_y_known:
+                # 前置孤立行: 从 min_seq - n_lead 开始递增(≥1)
+                nxt_seq = max(1, min_seq_known - n_lead) + assigned_lead
+                assigned_lead += 1
+            else:
+                prevs = [c for c in candidates if c[1] < y0]
+                base = max(prevs, key=lambda c: c[1]) if prevs else None
+                if base is not None:
+                    nxt_seq = base[0] + 1
+                    # 若与后一行序号冲突(>= 后一行), 说明推断异常, 用后一行-1
+                    nexts = [c for c in candidates if c[1] > y0]
+                    if nexts:
+                        nmin = min(nexts, key=lambda c: c[1])
+                        if nxt_seq >= nmin[0]:
+                            nxt_seq = nmin[0] - 1
+                else:
+                    nxt_seq = 1 + assigned_lead
+                    assigned_lead += 1
+            candidates.append((nxt_seq, y0, t))
+            wlog(f"    [补漏] 序号={nxt_seq} y={y0:.0f} 页号「{t}」(序号未被OCR识别, 已推断)")
+
+        # 按 y 去重(同一序号可能被 OCR 拆出多个同值片段)
+        candidates.sort(key=lambda c: c[1])
+        dedup = []
+        for c in candidates:
+            if dedup and abs(c[1] - dedup[-1][1]) < 30 and c[0] == dedup[-1][0]:
+                # 补页号(若前一条为空)
+                if not dedup[-1][2] and c[2]:
+                    dedup[-1] = (dedup[-1][0], dedup[-1][1], c[2])
+                continue
+            dedup.append(c)
+
+        # ---- 3. 解析页号(两种格式), 单数字推断止页=下一行起始-1 ----
         parsed = []
-        for r in rows:
-            compact = r.replace(' ', '').replace('　', '')
-            if '卷内文件目录' in compact:
+        for i, (seq, y, pagetxt) in enumerate(dedup):
+            if not pagetxt:
+                wlog(f"    跳过行(无页号): 序号={seq} y={y:.0f}")
                 continue
-            m_seq = re.match(r'^(\d{1})\D', compact + '.')  # 序号: 一位数字开头
-            m_pages = re.search(r'(\d{1,4})\s*[-–—~]\s*(\d{1,4})', r)
-            if not m_seq:
-                continue
-            seq = int(m_seq.group(1))
-            if not m_pages:
-                wlog(f"    跳过行(无页号): 「{r}」")
-                continue
-            p_start, p_end = int(m_pages.group(1)), int(m_pages.group(2))
-            if p_end < p_start:
-                p_start, p_end = p_end, p_start
+            m = re.fullmatch(r'(\d{1,4})[-–—~](\d{1,4})', pagetxt)
+            if m:
+                p_start, p_end = int(m.group(1)), int(m.group(2))
+                if p_end < p_start:
+                    p_start, p_end = p_end, p_start
+                src = pagetxt
+            else:
+                p_start = int(pagetxt)
+                # 找下一行的起始页
+                nxt = None
+                for j in range(i + 1, len(dedup)):
+                    if dedup[j][2]:
+                        m2 = re.match(r'(\d{1,4})', dedup[j][2])
+                        if m2:
+                            nxt = int(m2.group(1))
+                            break
+                p_end = (nxt - 1) if (nxt is not None and nxt > p_start) else p_start
+                src = f"{pagetxt}(推断到{p_end})"
             parsed.append((seq, p_start, p_end))
-            wlog(f"    解析行: 序号={seq} 页号={p_start}-{p_end} ← 「{r.strip()}」")
+            wlog(f"    解析行: 序号={seq} 页号={p_start}-{p_end} ← 「{src}」 y={y:.0f}")
+
+        # ---- 4. 连续性校验修正 ----
+        # 档案各件页号首尾相接(本行起始 = 前行止页+1, 本行止页 = 下行起始-1)。
+        # OCR 常把日期与页号粘连(如「2021.12.2039-143」实为页号「39-143」),
+        # 导致某端数字虚大。按相邻行的连续性约束重切粘连数字。
+        for i in range(len(parsed)):
+            seq, p_start, p_end = parsed[i]
+            prev_end = parsed[i - 1][2] if i > 0 else None
+            next_start = parsed[i + 1][1] if i + 1 < len(parsed) else None
+            raw = (dedup[i][2] if i < len(dedup) else '') or ''
+            m = re.fullmatch(r'(\d{1,5})[-–—~](\d{1,5})', raw.strip())
+            if not m:
+                continue
+            big, tail = m.group(1), m.group(2)
+            big_v, tail_v = int(big), int(tail)
+            lo, hi = (tail_v, big_v) if big_v > tail_v else (big_v, tail_v)
+            # 期望: start=prev_end+1 (若有前行), end=next_start-1 (若有后行)
+            exp_start = (prev_end + 1) if prev_end is not None else None
+            exp_end = (next_start - 1) if (next_start is not None and next_start > 1) else None
+            fixed = False
+            new_start, new_end = p_start, p_end
+            # 情形A: start 虚大(粘连在头, 如「2039-143」start 应为 39)
+            if exp_start is not None and lo != exp_start and hi == (exp_end or hi):
+                cand_s = big[-len(str(exp_start)):] if big_v > tail_v else tail[-len(str(exp_start)):]
+                if cand_s == str(exp_start):
+                    new_start, new_end = exp_start, hi
+                    fixed = True
+            # 情形B: end 虚大(粘连在尾)
+            if not fixed and exp_end is not None and hi > exp_end and lo == exp_start:
+                cand_e = tail[-len(str(exp_end)):] if tail_v > big_v else big[-len(str(exp_end)):]
+                if cand_e == str(exp_end):
+                    new_start, new_end = lo, exp_end
+                    fixed = True
+            # 情形C: 双端都可能粘连, 用两端约束直接切
+            if not fixed and exp_start is not None and exp_end is not None \
+                    and (lo != exp_start or hi != exp_end):
+                s_str, e_str = str(exp_start), str(exp_end)
+                joined = big + tail
+                # 尝试在 joined 中找 s_str 和 e_str 的合理组合
+                for cut in range(1, len(joined)):
+                    a, b = joined[:cut], joined[cut:]
+                    if a.endswith(s_str) and b.startswith(e_str) and len(a) >= len(s_str):
+                        new_start, new_end = exp_start, exp_end
+                        fixed = True
+                        break
+            if fixed and (new_start, new_end) != (p_start, p_end):
+                parsed[i] = (seq, new_start, new_end)
+                wlog(f"    [连续性修正] 序号={seq}: 页号 {p_start}-{p_end} → "
+                     f"{new_start}-{new_end} (原文「{raw}」日期与页号粘连, 已按邻行连续性切分)")
+        return parsed
+
+    # ---------- 表格线模式解析 ----------
+    _CN_NUM = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+               '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+
+    @staticmethod
+    def _imread_cn(path):
+        """中文路径安全读图(cv2.imread 不支持 Windows 非 ASCII 路径)。"""
+        try:
+            import cv2
+            import numpy as _np
+            data = _np.fromfile(path, dtype=_np.uint8)
+            if data.size == 0:
+                return None
+            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _imwrite_cn(path, img):
+        """中文路径安全写图(配套 _imread_cn)。"""
+        try:
+            import cv2
+            ext = '.png' if path.lower().endswith('.png') else '.jpg'
+            ok, buf = cv2.imencode(ext, img)
+            if ok:
+                buf.tofile(path)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _detect_table_rows(self, image_path):
+        """
+        OpenCV 检测表格横线, 返回数据行区间 [(top, bottom), ...] 或 []。
+        横线特征: 水平长线(≥图宽30%); 数据行=相邻横线间隔>100px。
+        """
+        try:
+            import cv2
+            import numpy as _np
+            img = self._imread_cn(image_path)
+            if img is None:
+                return []
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            H, W = gray.shape
+            _, bw = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+            hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(W // 15, 20), 1))
+            horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
+            ys = _np.where(horiz.sum(axis=1) > 255 * W * 0.3)[0]
+            lines = []
+            for y in ys:
+                if lines and y - lines[-1][-1] <= 5:
+                    lines[-1].append(y)
+                else:
+                    lines.append([y])
+            centers = [int(_np.mean(g)) for g in lines]
+            if len(centers) < 3:
+                return []
+            return [(centers[i], centers[i + 1])
+                    for i in range(len(centers) - 1)
+                    if centers[i + 1] - centers[i] > 100]
+        except Exception:
+            return []
+
+    def _parse_catalog_by_table(self, image_path, wlog):
+        """
+        表格线模式解析: 横线定位每个数据行 → 整行裁剪降采样后单独OCR →
+        按行提取 序号(数字或汉字一~十) + 页号(数字/范围/汉字数字)。
+        相比全图片段模式的优势: 行不漏(每行独立OCR)、序号跳号无误判
+        (序号来自本行而非推断)、支持汉字页号(一~十)。
+        返回 [(序号, 起, 止), ...]; 无表格线或全失败返回 []。
+        """
+        bands = self._detect_table_rows(image_path)
+        if not bands:
+            return []
+        wlog(f"    表格线模式: 检测到 {len(bands)} 个行区间")
+        try:
+            import cv2
+        except ImportError:
+            return []
+        img = self._imread_cn(image_path)
+        if img is None:
+            return []
+        H, W = img.shape[:2]
+
+        def to_page(txt):
+            """页号文本→(起,止)或None。支持 数字/范围/汉字一~十。"""
+            t = txt.strip().replace(' ', '')
+            m = re.fullmatch(r'(\d{1,4})[-–—~](\d{1,4})', t)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                return (min(a, b), max(a, b))
+            if re.fullmatch(r'\d{1,4}', t):
+                v = int(t)
+                return (v, v)
+            if t in self._CN_NUM:
+                v = self._CN_NUM[t]
+                return (v, v)
+            return None
+
+        def to_seq(txt):
+            t = txt.strip()
+            if re.fullmatch(r'\d{1,2}', t):
+                return int(t)
+            if t in self._CN_NUM:
+                return self._CN_NUM[t]
+            return None
+
+        results = []   # [(y_center, seq, (s,e))]
+        for bi, (y1, y2) in enumerate(bands):
+            # 跳过表头行(含"序号"字样)与跨行标题行(无页号且序号列无数字)
+            row_img = img[y1:y2]
+            # 降采样到宽~1200 提速
+            sc = 1200.0 / W
+            small = cv2.resize(row_img, (1200, max(1, int((y2 - y1) * sc))))
+            tmp = image_path + f'.row{bi}.png'
+            self._imwrite_cn(tmp, small)
+            r = self._ocr_page(tmp, None, lambda s: None)
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            if not r:
+                continue
+            texts = [t for t, *_ in r]
+            joined = ''.join(texts)
+            if '序号' in joined and '页号' in joined:
+                continue  # 表头行
+            # 找序号: 行内最左的纯数字(1-2位)或汉字数字
+            seq = None
+            seq_frag = None
+            seq_y = None
+            for t, x0, y0, x1, _y1 in sorted(r, key=lambda f: f[1]):
+                s = to_seq(t)
+                if s is not None and s <= 30:
+                    seq = s
+                    seq_frag = (t, x0, y0, x1)
+                    seq_y = (y1 + y2) / 2
+                    break
+            # 找页号: 行内任何位置的 页号形态(独立或长文本尾部)。
+            # 排除序号已占用的片段(避免把序号数字当单页页号, 如「4|...|48-132」)。
+            page = None
+            for t, x0, y0, x1, _y1 in r:
+                if seq_frag is not None and t == seq_frag[0] and x0 == seq_frag[1]:
+                    continue  # 序号片段不再参与页号
+                p = to_page(t)
+                if p:
+                    page = p
+                    break
+                # 长文本尾部粘连(与片段模式同规则)
+                for pat in (r'\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\s*(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$',
+                            r'(?:^|\D)(\d{1,4})\s*[-–—~]\s*(\d{1,4})\s*$'):
+                    m = re.search(pat, t)
+                    if m:
+                        a, b = int(m.group(1)), int(m.group(2))
+                        page = (min(a, b), max(a, b))
+                        break
+                if page:
+                    break
+            # 有页号即可入表(序号缺失的行, 后面按锚点插值补)
+            if page:
+                results.append((seq_y if seq_y is not None else (y1 + y2) / 2,
+                                seq, page))
+                wlog(f"    表格行{bi}: 序号={seq if seq is not None else '?'} "
+                     f"页号={page[0]}-{page[1]} "
+                     f"← 行y{y1}-{y2} OCR:{'|'.join(texts)[:60]}")
+
+        if not results:
+            return []
+        results.sort(key=lambda x: x[0])
+
+        # ---- 序号缺失行: 用已识别序号锚点线性插值 ----
+        # 例: 行位次[1,2,3] 序号[1,None,4] → 位次1=1, 位次3=4 → 位次2=3
+        # (插值取整; 两端外推: 首位=首锚点-前距, 末位=末锚点+后距)
+        idx_known = [(i, r[1]) for i, r in enumerate(results) if r[1] is not None]
+        if not idx_known:
+            # 完全无锚点(所有序号都被OCR漏识别): 档案序号从1起按位次递增
+            for i, r in enumerate(results):
+                results[i] = (r[0], i + 1, r[2])
+            wlog(f"    [序号兜底] 全部{len(results)}行序号未被OCR识别, "
+                 f"按位次从1递增赋值")
+        else:
+            for i, r in enumerate(results):
+                if r[1] is not None:
+                    continue
+                prevs = [k for k in idx_known if k[0] < i]
+                nexts = [k for k in idx_known if k[0] > i]
+                if prevs and nexts:
+                    (i0, s0) = prevs[-1]
+                    (i1, s1) = nexts[0]
+                    if i1 > i0:
+                        raw = s0 + (s1 - s0) * (i - i0) / (i1 - i0)
+                        # 锚点间序号增量>位次增量 → 档案存在跳号,
+                        # 插值向上取整偏向跳号解释(1,[?],4 → 3 而非 2)
+                        import math as _math
+                        guess = int(_math.ceil(raw)) if (s1 - s0) > (i1 - i0) \
+                            else int(round(raw))
+                        r_new = (r[0], guess, r[2])
+                        results[i] = r_new
+                        wlog(f"    [序号插值] 行位次{i+1}: 序号={r_new[1]} "
+                             f"(锚点 位次{i0+1}={s0}, 位次{i1+1}={s1}"
+                             f"{'跳号' if (s1 - s0) > (i1 - i0) else ''})")
+                elif nexts:
+                    # 在首锚点之前: 首锚点序号 - 位次差
+                    (i1, s1) = nexts[0]
+                    guess = s1 - (i1 - i)
+                    results[i] = (r[0], guess, r[2])
+                    wlog(f"    [序号插值] 行位次{i+1}: 序号={guess} (首锚点外推)")
+                elif prevs:
+                    (i0, s0) = prevs[-1]
+                    guess = s0 + (i - i0)
+                    results[i] = (r[0], guess, r[2])
+                    wlog(f"    [序号插值] 行位次{i+1}: 序号={guess} (末锚点外推)")
+
+        # 单数字页号行: 止页=下一行起始-1
+        parsed = []
+        for i, (y, seq, page) in enumerate(results):
+            s, e = page
+            if s == e:
+                nxt = None
+                for j in range(i + 1, len(results)):
+                    if results[j][2][0] > s:
+                        nxt = results[j][2][0]
+                        break
+                if nxt is not None and nxt > s:
+                    e = nxt - 1
+            parsed.append((seq, s, e))
         return parsed
 
     # ---------- 文件操作 ----------
@@ -319,8 +873,92 @@ class FileSplitWorker(QThread):
             return int(stem) if stem.isdigit() else float('inf')
         return sorted(files, key=key)
 
-    def _process_one_dir(self, subdir, logf, wlog):
-        """处理单个子目录。返回 (状态字符串, 移动文件数)。"""
+    def _parse_catalog_from_dir(self, subdir, wlog):
+        """
+        对子目录做「目录页定位 + OCR + 标题判断 + 表格解析」(不移动任何文件)。
+        分件与检查共用此入口, 保证两者行为一致。
+        目录页定位: 未分件=根下第2张(0002); 已分件=卷皮目录里的第2张。
+        返回 (entries, f1, f2, err):
+          成功: entries=[(序号,起,止),...], f1/f2=卷皮两文件名, err=''
+          失败: entries=[], err=状态字符串(跳过(xxx)/失败(xxx))
+        """
+        dir_name = os.path.basename(subdir)
+        jpgs = self._jpg_files_sorted(subdir)
+        if not jpgs:
+            return [], '', '', "跳过(无jpg)"
+
+        jp_dir = os.path.join(subdir, f"{dir_name}卷皮目录")
+        jp_jpgs = self._jpg_files_sorted(jp_dir) if os.path.isdir(jp_dir) else []
+        if len(jp_jpgs) >= 2:
+            f1, f2 = jp_jpgs[0], jp_jpgs[1]
+            page2_path = os.path.join(jp_dir, f2)
+            wlog(f"  目录页取自卷皮目录: {f2}")
+        elif len(jpgs) >= 2:
+            f1, f2 = jpgs[0], jpgs[1]
+            page2_path = os.path.join(subdir, f2)
+        else:
+            return [], '', '', "跳过(无目录页)"
+
+        rows = self._ocr_page(page2_path, None, wlog)
+        if not rows:
+            return [], f1, f2, "失败(OCR无结果)"
+        if not self._is_catalog_title(rows):
+            return [], f1, f2, "跳过(非目录页)"
+        wlog("  标题确认: 卷内文件目录")
+
+        # 优先: 表格线模式(逐行裁剪OCR, 不漏行/序号不推断/支持汉字页号)
+        try:
+            entries = self._parse_catalog_by_table(page2_path, wlog)
+        except Exception as e:
+            wlog(f"    表格线模式异常: {e}")
+            entries = []
+        if entries:
+            wlog(f"  表格线模式解析 {len(entries)} 行")
+            return entries, f1, f2, ""
+
+        # 回退: 全图片段模式
+        entries = self._parse_catalog_rows(rows, wlog)
+        if not entries:
+            return [], f1, f2, "失败(未解析到数据)"
+        return entries, f1, f2, ""
+
+    def _split_by_entries(self, subdir, entries, wlog, target_base=None, copy_mode=False):
+        """
+        按 entries 建序号子目录并处理文件(页号+2=文件名)。
+        target_base=None: 原地移动(在 subdir 下建子目录并移入);
+        target_base 指定: 输出到 target_base/目录名/ 下, copy_mode=True 拷贝
+        (源目录不动), False 仍移动。返回 处理文件数。分件/手工分件共用。
+        """
+        dir_name = os.path.basename(subdir)
+        out_root = os.path.join(target_base, dir_name) if target_base else subdir
+        def _op(src, dst):
+            if copy_mode:
+                shutil.copy2(src, dst)
+            else:
+                shutil.move(src, dst)
+        verb = '拷贝' if copy_mode else '移动'
+        moved = 0
+        for seq, p_start, p_end in entries:
+            sub_name = f"{dir_name}-{seq:04d}"
+            sub_path = os.path.join(out_root, sub_name)
+            os.makedirs(sub_path, exist_ok=True)
+            for n in range(p_start + 2, p_end + 3):
+                fname = f"{n:04d}.jpg"
+                src = os.path.join(subdir, fname)
+                if os.path.exists(src):
+                    try:
+                        _op(src, os.path.join(sub_path, fname))
+                        moved += 1
+                    except Exception as e:
+                        wlog(f"    × {verb}失败 {fname}: {e}")
+                else:
+                    wlog(f"    (缺) {fname} 不存在, 跳过")
+            wlog(f"  序号{seq}: 页号{p_start}-{p_end} → {sub_name}/ "
+                 f"{verb} {p_start + 2:04d}.jpg..{p_end + 2:04d}.jpg")
+        return moved
+
+    def _process_one_dir(self, subdir, logf, wlog, target_base=None, copy_mode=False):
+        """处理单个子目录。返回 (状态字符串, 处理文件数)。"""
         dir_name = os.path.basename(subdir)
         jpgs = self._jpg_files_sorted(subdir)
         if len(jpgs) < 4:
@@ -330,48 +968,28 @@ class FileSplitWorker(QThread):
         f1, f2 = jpgs[0], jpgs[1]
         wlog(f"  卷皮页: {f1}, {f2}; 总文件数: {len(jpgs)}")
 
-        # OCR 第2页
-        rows = self._ocr_page(os.path.join(subdir, f2), logf, wlog)
-        if not rows:
-            wlog(f"  [失败] {dir_name}: 第2页 OCR 无结果")
-            return "失败(OCR无结果)", 0
+        # OCR + 解析(与检查功能共用)
+        entries, f1, f2, err = self._parse_catalog_from_dir(subdir, wlog)
+        if err:
+            wlog(f"  [{err.split('(')[0]}] {dir_name}: {err}")
+            return err, 0
 
-        # 判断标题
-        if not self._is_catalog_title(rows):
-            wlog(f"  [跳过] {dir_name}: 第2页标题不是「卷内文件目录」")
-            return "跳过(非目录页)", 0
-        wlog(f"  标题确认: 卷内文件目录")
+        out_root = os.path.join(target_base, dir_name) if target_base else subdir
+        os.makedirs(out_root, exist_ok=True)
+        verb = '拷贝' if copy_mode else '移动'
+        def _op(src, dst):
+            if copy_mode:
+                shutil.copy2(src, dst)
+            else:
+                shutil.move(src, dst)
 
-        # 解析表格行
-        entries = self._parse_catalog_rows(rows, wlog)
-        if not entries:
-            wlog(f"  [失败] {dir_name}: 未解析到任何 序号/页号 行")
-            return "失败(未解析到数据)", 0
-
-        # 建序号子目录并移动文件
-        moved = 0
-        for seq, p_start, p_end in entries:
-            sub_name = f"{dir_name}-{seq:04d}"
-            sub_path = os.path.join(subdir, sub_name)
-            os.makedirs(sub_path, exist_ok=True)
-            # 页号+2 = 文件名: 页号1-17 → 0003.jpg..0019.jpg
-            for n in range(p_start + 2, p_end + 3):
-                fname = f"{n:04d}.jpg"
-                src = os.path.join(subdir, fname)
-                if os.path.exists(src):
-                    try:
-                        shutil.move(src, os.path.join(sub_path, fname))
-                        moved += 1
-                    except Exception as e:
-                        wlog(f"    × 移动失败 {fname}: {e}")
-                else:
-                    wlog(f"    (缺) {fname} 不存在, 跳过")
-            wlog(f"  序号{seq}: 页号{p_start}-{p_end} → {sub_name}/ "
-                 f"移动 {fname if False else f'{p_start + 2:04d}.jpg..{p_end + 2:04d}.jpg'}")
+        # 建序号子目录并处理文件(手工分件共用)
+        moved = self._split_by_entries(subdir, entries, wlog,
+                                       target_base=target_base, copy_mode=copy_mode)
 
         # 建备考表卷底 / 卷皮目录
-        path_beikao = os.path.join(subdir, f"{dir_name}备考表卷底")
-        path_juanpi = os.path.join(subdir, f"{dir_name}卷皮目录")
+        path_beikao = os.path.join(out_root, f"{dir_name}备考表卷底")
+        path_juanpi = os.path.join(out_root, f"{dir_name}卷皮目录")
         os.makedirs(path_beikao, exist_ok=True)
         os.makedirs(path_juanpi, exist_ok=True)
 
@@ -379,28 +997,40 @@ class FileSplitWorker(QThread):
         for fname in (f1, f2):
             src = os.path.join(subdir, fname)
             if os.path.exists(src):
-                shutil.move(src, os.path.join(path_juanpi, fname))
+                _op(src, os.path.join(path_juanpi, fname))
                 moved += 1
-        wlog(f"  卷皮: {f1},{f2} → {dir_name}卷皮目录/")
+        wlog(f"  卷皮: {f1},{f2} → {dir_name}卷皮目录/ [{verb}]")
 
         # 当前剩余文件里 最大与次大 → 备考表卷底
-        remain = self._jpg_files_sorted(subdir)
+        remain = self._jpg_files_sorted(subdir) if not copy_mode else self._jpg_files_sorted(subdir)
+        # 拷贝模式下源目录不变, 备考仍取(全部-已拷贝)后的最大两张 = 全部中最大两张
+        if copy_mode:
+            copied = set()
+            for seq, p_start, p_end in entries:
+                for n in range(p_start + 2, p_end + 3):
+                    copied.add(f"{n:04d}.jpg")
+            copied.update({f1, f2})
+            remain = [f for f in jpgs if f not in copied]
         if len(remain) >= 2:
             for fname in (remain[-1], remain[-2]):
                 src = os.path.join(subdir, fname)
-                shutil.move(src, os.path.join(path_beikao, fname))
+                _op(src, os.path.join(path_beikao, fname))
                 moved += 1
-            wlog(f"  备考: {remain[-2]},{remain[-1]} → {dir_name}备考表卷底/")
+            wlog(f"  备考: {remain[-2]},{remain[-1]} → {dir_name}备考表卷底/ [{verb}]")
         else:
-            wlog(f"  备考: 剩余文件不足2张({len(remain)}), 未移动")
+            wlog(f"  备考: 剩余文件不足2张({len(remain)}), 未处理")
 
-        return f"完成({len(entries)}件,移动{moved}个文件)", moved
+        return f"完成({len(entries)}件,{verb}{moved}个文件)", moved
 
     def run(self):
         try:
             if not os.path.isdir(self.base_dir):
                 self.finished_signal.emit(False, "所选目录不存在")
                 return
+
+            # 分件到新目录: 目标目录不存在则创建
+            if self.target_base:
+                os.makedirs(self.target_base, exist_ok=True)
 
             # 日志文件放在用户所选目录下
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -439,7 +1069,9 @@ class FileSplitWorker(QThread):
                 wlog(f"[{done + 1}/{total}] 处理: {os.path.basename(subdir)}")
                 wlog("-" * 50)
                 try:
-                    status, moved = self._process_one_dir(subdir, logf, wlog)
+                    status, moved = self._process_one_dir(
+                        subdir, logf, wlog,
+                        target_base=self.target_base, copy_mode=self.copy_mode)
                     moved_total += moved
                     wlog(f"  结果: {status}")
                 except Exception as e:
@@ -468,6 +1100,598 @@ class FileSplitWorker(QThread):
 
     def stop(self):
         self.is_stopped = True
+
+
+class FileSplitCheckWorker(FileSplitWorker):
+    """
+    分件检查后台线程 —— 继承 FileSplitWorker, OCR/解析/文件排序全部复用
+    分件代码(_parse_catalog_from_dir), 保证检查与分件行为完全一致。
+    对每个子目录: 解析目录页得到序号/页号, 推算「应被移走」的文件集合,
+    检测根目录中按标准应移走却仍残留的文件 → 记入检查报告。不移动任何文件。
+    """
+    progress_signal = Signal(int, int)
+
+    def __init__(self, base_dir, parent=None):
+        super().__init__(base_dir, parent=parent)
+
+    def _check_one_dir(self, subdir, wlog):
+        """
+        按分件规则检查单个子目录(不移动文件)。检查项:
+        1. 卷内文件目录页是否存在、能否正常解析(OCR失败/非目录页/无数据=错误);
+        2. 每段页号范围是否有足够文件(按页号+2=文件名, 范围内缺文件=错误);
+        3. 分件规则覆盖完成后, 根目录剩余的文件(未被任何页号段/卷皮/备考覆盖)=错误。
+        返回 (状态, 错误明细list) —— 每条错误含类型与对应文件名。
+        """
+        errors = []
+        dir_name = os.path.basename(subdir)
+        jpgs = self._jpg_files_sorted(subdir)
+        if not jpgs:
+            return "错误(无jpg)", [f"{dir_name}: [目录异常] 根目录无 jpg 文件"]
+
+        # --- 检查项1: 目录页存在性与可解析性(复用分件OCR) ---
+        entries, f1, f2, err = self._parse_catalog_from_dir(subdir, wlog)
+        if err:
+            # err 形如 "失败(OCR无结果)"/"跳过(非目录页)"/"失败(未解析到数据)"
+            etype = err.split('(')[0].strip()
+            return f"错误({err})", [f"{dir_name}: [目录解析] {err}"]
+
+        wlog(f"  解析到 {len(entries)} 段页号")
+
+        # 当前根目录实际存在的文件集合
+        existing = set(jpgs)
+        # 分件规则覆盖到的文件集合(含每段页号范围 + 卷皮 + 备考)
+        covered = set()
+
+        # --- 检查项2: 每段页号范围内文件是否足够 ---
+        for seq, p_start, p_end in entries:
+            expect = [f"{n:04d}.jpg" for n in range(p_start + 2, p_end + 3)]
+            missing = [f for f in expect if f not in existing]
+            covered.update(f for f in expect if f in existing)
+            if missing:
+                # 该段期望 (p_end-p_start+1) 个, 缺 len(missing) 个
+                total = p_end - p_start + 1
+                errors.append(f"{dir_name}: [文件不足] 序号{seq} 页号{p_start}-{p_end} "
+                              f"应有{total}个文件, 缺{len(missing)}个: "
+                              f"{', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}")
+                wlog(f"  [文件不足] 序号{seq}: 缺 {len(missing)} 个 "
+                     f"({', '.join(missing[:8])}{'...' if len(missing) > 8 else ''})")
+            else:
+                wlog(f"  序号{seq}: 页号{p_start}-{p_end} 文件齐全({len(expect)}个)")
+
+        # 卷皮(0001/0002)与备考(剩余最大两张)也计入覆盖
+        for fname in (f1, f2):
+            if fname in existing:
+                covered.add(fname)
+        remain_sim = [f for f in jpgs if f not in covered]
+        if len(remain_sim) >= 2:
+            covered.add(remain_sim[-1])
+            covered.add(remain_sim[-2])
+
+        # --- 检查项3: 规则覆盖后仍剩余的文件 ---
+        leftover = [f for f in jpgs if f not in covered]
+        if leftover:
+            errors.append(f"{dir_name}: [剩余文件] 分件规则未覆盖, 残留 "
+                          f"{len(leftover)} 个: {', '.join(leftover[:10])}"
+                          f"{'...' if len(leftover) > 10 else ''}")
+            wlog(f"  [剩余文件] {len(leftover)} 个未被覆盖: "
+                 f"{', '.join(leftover[:8])}{'...' if len(leftover) > 8 else ''}")
+
+        if errors:
+            return f"错误({len(errors)}项)", errors
+        return "正常", errors
+
+    def run(self):
+        try:
+            if not os.path.isdir(self.base_dir):
+                self.finished_signal.emit(False, "所选目录不存在")
+                return
+
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            report_path = os.path.join(self.base_dir, f"分件检查报告_{ts}.txt")
+            logf = open(report_path, 'w', encoding='utf-8')
+            lock = __import__('threading').Lock()
+
+            def wlog(s):
+                with lock:
+                    logf.write(s + "\n")
+                    logf.flush()
+                self.log_signal.emit(s)
+
+            wlog("分件检查报告")
+            wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"所选目录: {self.base_dir}")
+            wlog("检查标准: 复用分件OCR解析, 推算应移走文件, 检测根目录残留")
+            wlog("=" * 70)
+
+            subdirs = sorted([os.path.join(self.base_dir, d)
+                              for d in os.listdir(self.base_dir)
+                              if os.path.isdir(os.path.join(self.base_dir, d))])
+            total = len(subdirs)
+            if total == 0:
+                logf.close()
+                self.finished_signal.emit(False, "所选目录下没有子目录")
+                return
+
+            wlog(f"共 {total} 个子目录待检查")
+            all_errors = []
+            stats = {}
+            done = 0
+            for subdir in subdirs:
+                if self.is_stopped:
+                    wlog("用户停止检查")
+                    break
+                wlog("")
+                wlog(f"[{done + 1}/{total}] 检查: {os.path.basename(subdir)}")
+                wlog("-" * 50)
+                try:
+                    status, errs = self._check_one_dir(subdir, wlog)
+                    stats[status] = stats.get(status, 0) + 1
+                    if errs:
+                        # 按目录归组: 目录名 + 各错误类型(含文件名)
+                        all_errors.append((os.path.basename(subdir), errs))
+                    wlog(f"  结果: {status}")
+                except Exception as e:
+                    import traceback
+                    wlog(f"  [异常] {e}")
+                    wlog(traceback.format_exc())
+                    all_errors.append((os.path.basename(subdir),
+                                       [f"[检查异常] {e}"]))
+                done += 1
+                self.progress_signal.emit(done, total)
+
+            wlog("")
+            wlog("=" * 70)
+            wlog("检查汇总:")
+            for k, v in sorted(stats.items()):
+                wlog(f"  {k}: {v} 个目录")
+            n_err_dirs = len(all_errors)
+            n_err_items = sum(len(e) for _, e in all_errors)
+            wlog(f"有错误的目录: {n_err_dirs} 个, 错误共 {n_err_items} 项")
+            if all_errors:
+                wlog("")
+                wlog("错误明细(按目录, 含错误类型与文件名):")
+                for dname, errs in all_errors:
+                    wlog(f"  ▷ {dname}")
+                    for e in errs:
+                        wlog(f"     × {e}")
+            wlog("")
+            wlog(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logf.close()
+
+            msg = (f"检查完成！{done}/{total} 个目录；"
+                   f"{n_err_dirs} 个目录有错误(共{n_err_items}项)。\n"
+                   f"报告: {os.path.basename(report_path)}")
+            self.finished_signal.emit(not self.is_stopped, msg)
+        except Exception as e:
+            import traceback
+            self.log_signal.emit(traceback.format_exc())
+            self.finished_signal.emit(False, f"检查出错: {e}")
+
+
+def manual_split_entries(text):
+    """
+    解析手工分件输入(多行)为分件条目。
+    行格式:
+      卷皮目录: 1-2          (可选, 文件名页码, 直接用不+2)
+      备考表卷底: 213-214    (可选, 同上)
+      1 1-180               (序号 页号; 页号+2=文件名, 与自动分件一致)
+    页号支持单数字(183)或范围(184-197)。
+    返回 (卷皮range|None, 备考range|None, entries, err)。
+    校验: 格式/序号唯一升序/页号连续性(本条起始=前条止页+1)。
+    """
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return None, None, [], "未输入任何内容"
+
+    juanpi = beikao = None
+    entries = []
+
+    def parse_range(s):
+        m = re.fullmatch(r'(\d{1,4})\s*[-–—~]\s*(\d{1,4})', s.strip())
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            return (min(a, b), max(a, b))
+        if re.fullmatch(r'\d{1,4}', s.strip()):
+            v = int(s.strip())
+            return (v, v)
+        return None
+
+    for ln in lines:
+        low = ln.replace(' ', '').replace('：', ':')
+        if low.startswith('卷皮目录'):
+            parts = ln.split(':', 1) if ':' in ln else ln.split('：', 1)
+            if len(parts) < 2:
+                return None, None, [], "「卷皮目录」行缺少页号(格式: 卷皮目录: 1-2)"
+            r = parse_range(parts[1])
+            if not r:
+                return None, None, [], f"「卷皮目录」页号格式错误: {parts[1]}"
+            juanpi = r
+            continue
+        if low.startswith('备考表卷底'):
+            parts = ln.split(':', 1) if ':' in ln else ln.split('：', 1)
+            if len(parts) < 2:
+                return None, None, [], "「备考表卷底」行缺少页号(格式: 备考表卷底: 213-214)"
+            r = parse_range(parts[1])
+            if not r:
+                return None, None, [], f"「备考表卷底」页号格式错误: {parts[1]}"
+            beikao = r
+            continue
+        parts = ln.split()
+        if len(parts) != 2:
+            return None, None, [], f"行格式错误(应为「序号 页号」): {ln}"
+        if not re.fullmatch(r'\d{1,2}', parts[0]):
+            return None, None, [], f"序号须为1-2位数字: {parts[0]}"
+        r = parse_range(parts[1])
+        if not r:
+            return None, None, [], f"页号格式错误(应为 17 或 17-101): {parts[1]}"
+        entries.append((int(parts[0]), r[0], r[1]))
+
+    if not entries:
+        return None, None, [], "未输入任何序号/页号数据行"
+
+    seqs = [e[0] for e in entries]
+    if len(set(seqs)) != len(seqs):
+        return None, None, [], f"序号重复: {seqs}"
+    if seqs != sorted(seqs):
+        return None, None, [], f"序号未按升序: {seqs}"
+
+    for i in range(1, len(entries)):
+        prev_end = entries[i - 1][2]
+        cur_start = entries[i][1]
+        if cur_start != prev_end + 1:
+            return (None, None, [],
+                    f"页号不连续: 序号{entries[i - 1][0]}止于{prev_end}, "
+                    f"序号{entries[i][0]}应从{prev_end + 1}开始, 实际{cur_start}")
+    return juanpi, beikao, entries, ""
+
+
+class ManualSplitDialog(QDialog):
+    """
+    手工分件对话框: 列出待处理目录, 用户输入多行序号/页号(前两行可选
+    卷皮目录/备考表卷底的文件名页码), 校验后执行分件; 完成自动切换下一个。
+    文件移动复用 FileSplitWorker._split_by_entries。
+    """
+
+    def __init__(self, base_dir, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.pending_dirs = self._scan_pending()
+        self.current_idx = -1
+        self.total_moved = 0
+        self.splitter = FileSplitWorker(base_dir)  # 仅用其文件排序/移动方法
+
+        self.setWindowTitle("手工分件")
+        self.resize(760, 640)
+
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("待处理目录:"))
+        self.dir_list = QListWidget()
+        self.dir_list.setMaximumHeight(140)
+        for d in self.pending_dirs:
+            self.dir_list.addItem(d)
+        self.dir_list.currentRowChanged.connect(self.on_dir_selected)
+        v.addWidget(self.dir_list)
+
+        v.addWidget(QLabel("分件数据表格 (「页号」支持 17 或 17-101; 序号行页号按+2换算;\n"
+                           "卷皮目录/备考表卷底行输入文件名页码, 不换算, 留空用默认):"))
+        # 表格输入: 第0/1行固定为 卷皮目录/备考表卷底, 其后为数据行
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["序号", "页号", "说明"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self._init_table_rows()
+        # 回车跳到下一个输入项: 在数据行内 序号→页号→下一行序号→…;
+        # 最后一行末格回车自动加行并进入新行序号格
+        self.table.keyPressEvent = self._table_key_press
+        # 工具行: 增/删数据行
+        tr = QHBoxLayout()
+        btn_add = QPushButton("+ 加行")
+        btn_add.setObjectName("BrowseBtn")
+        btn_add.clicked.connect(self.add_row)
+        tr.addWidget(btn_add)
+        btn_del = QPushButton("− 删选中行")
+        btn_del.setObjectName("BrowseBtn")
+        btn_del.clicked.connect(self.del_row)
+        tr.addWidget(btn_del)
+        tr.addStretch()
+        v.addLayout(tr)
+        v.addWidget(self.table, 1)
+
+        self.hint = QLabel("")
+        self.hint.setStyleSheet("color: #B45309; font-size: 12px;")
+        v.addWidget(self.hint)
+
+        h = QHBoxLayout()
+        self.apply_btn = QPushButton("执行分件")
+        self.apply_btn.setObjectName("ActionBtn")
+        self.apply_btn.clicked.connect(self.apply)
+        h.addWidget(self.apply_btn)
+        self.skip_btn = QPushButton("跳过此目录")
+        self.skip_btn.setObjectName("BrowseBtn")
+        self.skip_btn.clicked.connect(self.skip)
+        h.addWidget(self.skip_btn)
+        self.close_btn = QPushButton("结束")
+        self.close_btn.setObjectName("BrowseBtn")
+        self.close_btn.clicked.connect(self.close)
+        h.addWidget(self.close_btn)
+        h.addStretch()
+        v.addLayout(h)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(150)
+        v.addWidget(QLabel("处理日志:"))
+        v.addWidget(self.log_box)
+
+        if self.pending_dirs:
+            self.dir_list.setCurrentRow(0)
+        else:
+            self.hint.setText("所选目录下没有待处理目录(根下有jpg且未分件的子目录)")
+
+    def _scan_pending(self):
+        """待处理 = 根下有 jpg 且未分件(无 -NNNN 序号子目录/卷皮未归档)的子目录。"""
+        out = []
+        try:
+            for d in sorted(os.listdir(self.base_dir)):
+                p = os.path.join(self.base_dir, d)
+                if not os.path.isdir(p):
+                    continue
+                jpgs = [f for f in os.listdir(p)
+                        if f.lower().endswith('.jpg')
+                        and os.path.isfile(os.path.join(p, f))]
+                if not jpgs:
+                    continue
+                subs = [s for s in os.listdir(p)
+                        if os.path.isdir(os.path.join(p, s))
+                        and re.search(r'-\d{4}$', s)]
+                if subs and len(jpgs) <= 2:
+                    continue
+                out.append(d)
+        except Exception:
+            pass
+        return out
+
+    def log(self, s):
+        self.log_box.append(f">> {s}")
+
+    # ---------- 表格输入辅助 ----------
+    def _init_table_rows(self):
+        """初始化表格: 前2行固定(卷皮目录/备考表卷底), 预置5个空数据行。"""
+        self.table.setRowCount(0)
+        self._append_fixed_row("卷皮目录", "文件名页码, 不+2换算; 留空=默认0001/0002")
+        self._append_fixed_row("备考表卷底", "文件名页码, 不+2换算; 留空=默认剩余最大两张")
+        for _ in range(5):
+            self.add_row()
+
+    def _append_fixed_row(self, name, note):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        it0 = QTableWidgetItem(name)
+        it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)  # 名称列锁定
+        self.table.setItem(r, 0, it0)
+        self.table.setItem(r, 1, QTableWidgetItem(""))
+        it2 = QTableWidgetItem(note)
+        it2.setFlags(it2.flags() & ~Qt.ItemIsEditable)
+        self.table.setItem(r, 2, it2)
+
+    def add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(""))
+        self.table.setItem(r, 1, QTableWidgetItem(""))
+        self.table.setItem(r, 2, QTableWidgetItem(""))
+
+    def _table_key_press(self, event):
+        """回车→下一个输入项: 页号列→下一行序号列; 序号列→本行页号列。
+        最后一行页号回车→自动加行并进入新行序号格。其余按键走默认处理。"""
+        from PyQt5.QtGui import QKeyEvent
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            r = self.table.currentRow()
+            c = self.table.currentColumn()
+            if r < 0:
+                return
+            if c == 0:
+                # 序号 → 本行页号
+                self.table.setCurrentCell(r, 1)
+                self.table.editItem(self.table.item(r, 1))
+                return
+            if c == 1:
+                # 页号 → 下一行序号; 末行则加行
+                if r + 1 < self.table.rowCount():
+                    self.table.setCurrentCell(r + 1, 0)
+                    self.table.editItem(self.table.item(r + 1, 0))
+                else:
+                    self.add_row()
+                    self.table.setCurrentCell(r + 1, 0)
+                    self.table.editItem(self.table.item(r + 1, 0))
+                return
+        # 其余按键交给 QTableWidget 默认处理
+        return QTableWidget.keyPressEvent(self.table, event)
+
+    def del_row(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            if r >= 2:  # 固定行不可删
+                self.table.removeRow(r)
+
+    def _table_values(self):
+        """读取表格 → (卷皮range|None, 备考range|None, entries, err)。"""
+        def parse_range(s):
+            t = s.strip().replace(' ', '')
+            m = re.fullmatch(r'(\d{1,4})[-–—~](\d{1,4})', t)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                return (min(a, b), max(a, b))
+            if re.fullmatch(r'\d{1,4}', t):
+                return (int(t), int(t))
+            return None
+
+        def cell(r, c):
+            it = self.table.item(r, c)
+            return (it.text() if it else '').strip()
+
+        jp_txt = cell(0, 1)
+        bk_txt = cell(1, 1)
+        if jp_txt and jp_txt != '-':
+            juanpi = parse_range(jp_txt)
+            if not juanpi:
+                return None, None, [], f"卷皮目录页号格式错误: {jp_txt}"
+        else:
+            juanpi = None
+        if bk_txt and bk_txt != '-':
+            beikao = parse_range(bk_txt)
+            if not beikao:
+                return None, None, [], f"备考表卷底页号格式错误: {bk_txt}"
+        else:
+            beikao = None
+
+        entries = []
+        for r in range(2, self.table.rowCount()):
+            seq_txt = cell(r, 0)
+            pg_txt = cell(r, 1)
+            if not seq_txt and not pg_txt:
+                continue  # 空行跳过
+            if not re.fullmatch(r'\d{1,2}', seq_txt):
+                return None, None, [], f"第{r - 1}行序号须为1-2位数字: 「{seq_txt}」"
+            pg = parse_range(pg_txt)
+            if not pg:
+                return None, None, [], f"序号{seq_txt}页号格式错误(17 或 17-101): 「{pg_txt}」"
+            entries.append((int(seq_txt), pg[0], pg[1]))
+
+        if not entries:
+            return None, None, [], "未输入任何序号/页号数据行"
+
+        seqs = [e[0] for e in entries]
+        if len(set(seqs)) != len(seqs):
+            return None, None, [], f"序号重复: {seqs}"
+        if seqs != sorted(seqs):
+            return None, None, [], f"序号未按升序: {seqs}"
+        for i in range(1, len(entries)):
+            prev_end = entries[i - 1][2]
+            cur_start = entries[i][1]
+            if cur_start != prev_end + 1:
+                return (None, None, [],
+                        f"页号不连续: 序号{entries[i - 1][0]}止于{prev_end}, "
+                        f"序号{entries[i][0]}应从{prev_end + 1}开始, 实际{cur_start}")
+        return juanpi, beikao, entries, ""
+
+    def on_dir_selected(self, row):
+        self.current_idx = row
+        if 0 <= row < len(self.pending_dirs):
+            self.hint.setText(f"当前目录: {self.pending_dirs[row]}  "
+                              f"(第 {row + 1}/{len(self.pending_dirs)} 个)")
+            # 清空数据行(保留卷皮/备考两固定行)
+            while self.table.rowCount() > 2:
+                self.table.removeRow(self.table.rowCount() - 1)
+            for _ in range(5):
+                self.add_row()
+            self.table.setFocus()
+
+    def apply(self):
+        if not (0 <= self.current_idx < len(self.pending_dirs)):
+            QMessageBox.warning(self, "提示", "请先在列表中选择待处理目录")
+            return
+        juanpi, beikao, entries, err = self._table_values()
+        if err:
+            self.hint.setText("输入错误: " + err)
+            QMessageBox.warning(self, "输入错误", err)
+            return
+
+        dir_name = self.pending_dirs[self.current_idx]
+        subdir = os.path.join(self.base_dir, dir_name)
+        reply = QMessageBox.question(
+            self, "确认分件",
+            f"将对 {dir_name} 执行分件:\n"
+            + ''.join(f"  序号{s}: {a}-{b}\n" for s, a, b in entries)
+            + "文件将被移动(不可自动撤销)，确定执行吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.log(f"── 分件: {dir_name} ──")
+
+        def move_named(dst_path, rng):
+            """卷皮/备考: 输入即文件名页码(不+2), 复用移动语义。"""
+            os.makedirs(dst_path, exist_ok=True)
+            cnt = 0
+            for n in range(rng[0], rng[1] + 1):
+                fname = f"{n:04d}.jpg"
+                src = os.path.join(subdir, fname)
+                if os.path.exists(src):
+                    shutil.move(src, os.path.join(dst_path, fname))
+                    cnt += 1
+                else:
+                    self.log(f"    (缺) {fname} 不存在, 跳过")
+            return cnt
+
+        # 序号子目录 —— 复用分件worker的移动方法
+        moved = self.splitter._split_by_entries(subdir, entries, self.log)
+
+        # 卷皮目录
+        jp_path = os.path.join(subdir, f"{dir_name}卷皮目录")
+        if juanpi:
+            c = move_named(jp_path, juanpi)
+            self.log(f"  卷皮: 文件{juanpi[0]:04d}-{juanpi[1]:04d} → {dir_name}卷皮目录/ 移动{c}个")
+        else:
+            os.makedirs(jp_path, exist_ok=True)
+            jpgs = self.splitter._jpg_files_sorted(subdir)
+            for fname in (jpgs[0], jpgs[1]) if len(jpgs) >= 2 else []:
+                src = os.path.join(subdir, fname)
+                if os.path.exists(src):
+                    shutil.move(src, os.path.join(jp_path, fname))
+                    moved += 1
+            self.log(f"  卷皮: 默认(最小两张) → {dir_name}卷皮目录/")
+
+        # 备考表卷底
+        bk_path = os.path.join(subdir, f"{dir_name}备考表卷底")
+        if beikao:
+            c = move_named(bk_path, beikao)
+            self.log(f"  备考: 文件{beikao[0]:04d}-{beikao[1]:04d} → {dir_name}备考表卷底/ 移动{c}个")
+        else:
+            os.makedirs(bk_path, exist_ok=True)
+            remain = self.splitter._jpg_files_sorted(subdir)
+            if len(remain) >= 2:
+                for fname in (remain[-1], remain[-2]):
+                    shutil.move(os.path.join(subdir, fname),
+                                os.path.join(bk_path, fname))
+                    moved += 1
+                self.log(f"  备考: 默认(剩余最大两张) → {dir_name}备考表卷底/")
+            else:
+                self.log(f"  备考: 剩余不足2张({len(remain)}), 未移动")
+
+        self.total_moved += moved
+        self.log(f"结果: 完成({len(entries)}件, 移动{moved}个文件)")
+
+        # 从待处理列表移除并自动切换下一个
+        self.pending_dirs.pop(self.current_idx)
+        self.dir_list.clear()
+        for d in self.pending_dirs:
+            self.dir_list.addItem(d)
+        if self.pending_dirs:
+            nxt = min(self.current_idx, len(self.pending_dirs) - 1)
+            self.dir_list.setCurrentRow(nxt)
+            self.hint.setText(f"已完成 {dir_name}。自动切换到下一个: {self.pending_dirs[nxt]}")
+        else:
+            self.hint.setText("全部待处理目录分件完成！")
+            QMessageBox.information(self, "完成",
+                                    f"全部分件完成！共移动 {self.total_moved} 个文件。")
+            self.close()
+
+    def skip(self):
+        if 0 <= self.current_idx < len(self.pending_dirs):
+            d = self.pending_dirs.pop(self.current_idx)
+            self.log(f"跳过: {d}")
+            self.dir_list.clear()
+            for dd in self.pending_dirs:
+                self.dir_list.addItem(dd)
+            if self.pending_dirs:
+                self.dir_list.setCurrentRow(min(self.current_idx, len(self.pending_dirs) - 1))
+            else:
+                self.hint.setText("全部待处理目录已处理(或跳过)")
+                QMessageBox.information(self, "完成", "全部待处理目录已处理完成。")
+                self.close()
 
 
 class FileRenameWorker(QThread):
@@ -2164,6 +3388,8 @@ class JpgToPdfWorker(QThread):
         self.is_stopped = False
         import threading
         self._ofd_lock = threading.Lock()
+        self._ocr_lock = threading.Lock()   # PaddleOCR 推理非线程安全, 串行化
+        self._ocr = None  # PaddleOCR 延迟初始化(与分件共享同一初始化逻辑)
         
         # 检查 OFD 转换库是否可用（用于生成双层OFD）
         # 使用自建 ofd_writer（基于 PyMuPDF，生成图像层+文本层的双层OFD，
@@ -2180,6 +3406,9 @@ class JpgToPdfWorker(QThread):
     
     def run(self):
         try:
+            # 输出目录不存在则创建(缺省为 源目录/PDF, 可能尚不存在)
+            if self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
             # 收集所有目录下的JPG文件
             dir_jpgs_map = self.collect_jpg_files()
             if not dir_jpgs_map:
@@ -2302,68 +3531,124 @@ class JpgToPdfWorker(QThread):
         
         return pdf_path
     
+    # 复用分件功能的本地 PaddleOCR(多配置兼容初始化+中文路径安全)
+    _get_ocr = FileSplitWorker._get_ocr
+    _ocr_page = FileSplitWorker._ocr_page
+    _imread_cn = staticmethod(FileSplitWorker._imread_cn)
+
+    def _ocr_local_available(self):
+        """本地OCR是否可用(初始化一次)。"""
+        return self._get_ocr() is not None
+
     def process_jpgs_to_ocr_pdf(self, jpg_paths, output_dir, pdf_filename):
-        """将多个JPG文件合并转换为双层PDF（图像+OCR文本层）"""
+        """
+        将多个JPG文件合并转换为双层PDF（图像+OCR文本层）。
+        OCR使用与分件功能一致的本地 PaddleOCR(无需UmiOCR/联网):
+          逐图OCR取文本+坐标 → PyMuPDF 逐页插图与不可见文本层。
+        """
         Image.MAX_IMAGE_PIXELS = None
-        
-        # 首先将 JPG 文件合并为 PDF
-        temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
-        
+        ocr = self._get_ocr()
+        if ocr is None:
+            # 本地OCR不可用: 回退仅图像PDF
+            temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
+            return temp_pdf_path, "仅图像PDF（本地OCR不可用）"
+
         try:
-            # 使用UmiOCR对PDF进行OCR处理
-            from pdf_ocr_processor import UmiOCRProcessor
-            ocr_processor = UmiOCRProcessor()
-            
-            # 进行OCR处理
-            ocr_result, download_path = ocr_processor.ocr_pdf(temp_pdf_path)
-            
-            # 从下载的zip文件中提取双层PDF
-            if download_path and os.path.exists(download_path):
-                import zipfile
-                with zipfile.ZipFile(download_path, 'r') as zip_ref:
-                    all_files = zip_ref.namelist()
-                    
-                    # 查找pdfLayered文件（双层PDF）
-                    layered_pdf_files = []
-                    for ext in ['.pdfLayered.pdf', '.Layered.pdf', '.layered.pdf']:
-                        layered_pdf_files = [f for f in all_files if f.endswith(ext)]
-                        if layered_pdf_files:
-                            break
-                    
-                    # 如果上述都没有找到，尝试包含'layered'的文件
-                    if not layered_pdf_files:
-                        layered_pdf_files = [f for f in all_files if 'layered' in f.lower()]
-                    
-                    # 如果仍然没有找到，使用任何PDF文件
-                    if not layered_pdf_files:
-                        layered_pdf_files = [f for f in all_files if f.endswith('.pdf')]
-                    
-                    if layered_pdf_files:
-                        target_pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
-                        
-                        # 提取双层PDF文件
-                        with zip_ref.open(layered_pdf_files[0]) as source, open(target_pdf_path, 'wb') as target:
-                            target.write(source.read())
-                        
-                        zip_ref.close()
-                        
-                        # 删除下载的zip文件
-                        os.remove(download_path)
-                        
-                        return target_pdf_path, "双层PDF生成成功"
-                    else:
-                        os.remove(download_path)
-                        return temp_pdf_path, "仅图像PDF（无OCR层）"
-            else:
-                return temp_pdf_path, "OCR处理失败"
-            
+            import fitz  # PyMuPDF
+        except ImportError:
+            temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
+            return temp_pdf_path, "仅图像PDF（缺PyMuPDF）"
+
+        pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
+        doc = fitz.open()
+        ocr_lock = getattr(self, '_ocr_lock', None)
+        try:
+            for jpg_path in jpg_paths:
+                if self.is_stopped:
+                    break
+                img = Image.open(jpg_path)
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                w_px, h_px = img.size
+                # PDF页面尺寸: 像素/分辨率*72 (resolution 默认100dpi)
+                w_pt = w_px * 72.0 / self.resolution
+                h_pt = h_px * 72.0 / self.resolution
+                page = doc.new_page(width=w_pt, height=h_pt)
+                page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), filename=jpg_path)
+
+                # OCR文本层(坐标从像素换算到PDF点)
+                if ocr_lock is not None:
+                    with ocr_lock:
+                        frags = self._ocr_page(jpg_path, None, lambda s: None)
+                else:
+                    frags = self._ocr_page(jpg_path, None, lambda s: None)
+                sx = w_pt / w_px
+                sy = h_pt / h_px
+                for txt, x0, y0, x1, y1 in frags:
+                    if not txt.strip():
+                        continue
+                    # 字号优先用 OCR 片段的「真实行高」(y1-y0, 像素)换算——
+                    # 卷皮页大字标题按宽度估算会得到超大值(被钳到上限40),
+                    # 全页同字号巨字文本在 WPS 中不被作为可选对象(其他页正常)。
+                    # 宽度估算仅作行高缺失时的兜底; 中文段宽度校验用于防溢出。
+                    h_px_txt = max(y1 - y0, 1.0)
+                    fs_h = h_px_txt * sy
+                    w_pt_txt = max((x1 - x0) * sx, 1.0)
+                    eff = sum(1.0 if ord(c) > 127 else 0.55 for c in txt) or 1.0
+                    fs_w = w_pt_txt / eff
+                    fs = fs_h if fs_h > 0 else fs_w
+                    fs = max(4.0, min(fs, 60.0))
+                    base_y = y0 * sy + fs
+                    # 按连续同类字符切分为段 [(文本, 是否中文)]
+                    seg_list = []
+                    cur = ''
+                    cur_cn = None
+                    for ch in txt:
+                        cn = ord(ch) > 127
+                        if cur_cn is None or cn == cur_cn:
+                            cur += ch
+                            cur_cn = cn
+                        else:
+                            seg_list.append((cur, cur_cn))
+                            cur, cur_cn = ch, cn
+                    if cur:
+                        seg_list.append((cur, cur_cn))
+                    # 逐段插入, x随实际advance推进(中文=fs, ASCII≈fs*0.5)
+                    # 隐形可选文本: render_mode=0(正常填充文本, 编辑器识别为可选
+                    # 对象) + fill_opacity=0(完全透明, 任何底色上都不可见)。
+                    # —— render_mode=3 在WPS等编辑器中无法选中; 白色文字在
+                    # 深色底图上会显现。透明填充两全其美。
+                    cx = x0 * sx
+                    for seg, is_cn in seg_list:
+                        if not seg:
+                            continue
+                        fname = 'china-s' if is_cn else 'helv'
+                        try:
+                            page.insert_text(fitz.Point(cx, base_y), seg,
+                                             fontsize=fs,
+                                             color=(0, 0, 0), fill_opacity=0,
+                                             fontname=fname)
+                        except Exception:
+                            try:
+                                page.insert_text(fitz.Point(cx, base_y), seg,
+                                                 fontsize=fs,
+                                                 color=(0, 0, 0), fill_opacity=0)
+                            except Exception:
+                                pass
+                        cx += len(seg) * (fs if is_cn else fs * 0.5)
+            doc.save(pdf_path)
+            doc.close()
+            if self.is_stopped:
+                return pdf_path, "已停止(部分页生成)"
+            return pdf_path, "双层PDF生成成功(本地OCR)"
         except Exception as e:
-            print(f"OCR处理出错: {str(e)}")
-            return temp_pdf_path, f"OCR处理错误: {str(e)}"
-        finally:
-            # 确保临时PDF文件被删除
-            if os.path.exists(temp_pdf_path) and temp_pdf_path != os.path.join(output_dir, pdf_filename + ".pdf"):
-                os.remove(temp_pdf_path)
+            try:
+                doc.close()
+            except Exception:
+                pass
+            # 失败回退: 仅图像PDF
+            temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
+            return temp_pdf_path, f"OCR处理错误: {str(e)}(已回退为仅图像PDF)"
     
     def convert_pdf_to_ofd(self, pdf_path, ofd_path):
         """使用 ofd_writer 将双层PDF转换为双层OFD(图像层+文本层，无页数限制)。"""
@@ -2404,9 +3689,25 @@ class JpgToPdfWorker(QThread):
         ofd_filename = ""
         
         try:
+            # 输出结构(与分件一致): 输出目录/顶层目录名/子目录名/子目录名.pdf
+            # 例: 源 D:\扫描\J380-ZY·2021-Y-FGC-0001\J380-0001\*.jpg
+            #     → 输出 PDF目录\J380-ZY·2021-Y-FGC-0001\J380-0001\J380-0001.pdf
+            # dir_name 为当前子目录名; jpg_files[0]含完整路径可提取父目录链。
+            out_subdir = os.path.join(self.output_dir, dir_name)
+            # 源子目录相对源根的路径(可能多级), 保持层级镜像到输出目录
+            src_root = getattr(self, 'directory_path', None)
+            if src_root and jpg_files:
+                try:
+                    src_dir = os.path.dirname(jpg_files[0])
+                    rel = os.path.relpath(src_dir, src_root)
+                    if rel and rel != '.':
+                        out_subdir = os.path.join(self.output_dir, rel)
+                except Exception:
+                    pass
+            os.makedirs(out_subdir, exist_ok=True)
             pdf_filename = dir_name
             result_pdf_path, ocr_status = self.process_jpgs_to_ocr_pdf(
-                jpg_files, self.output_dir, pdf_filename
+                jpg_files, out_subdir, pdf_filename
             )
             if result_pdf_path:
                 result = "成功"
@@ -2495,6 +3796,7 @@ class JpgToPdfPage(FunctionPage):
         h1.addWidget(btn_browse_src)
         
         self.out_dir = QLineEdit()
+        self._out_manual = False  # 用户是否手动改过输出目录(改过则不随源联动)
         btn_browse_out = QPushButton("选择文件夹")
         btn_browse_out.setObjectName("BrowseBtn")
         btn_browse_out.clicked.connect(self.browse_out_dir)
@@ -2503,8 +3805,9 @@ class JpgToPdfPage(FunctionPage):
         h2.addWidget(btn_browse_out)
 
         self.thread_spin = QSpinBox()
-        self.thread_spin.setRange(1, 32)
-        self.thread_spin.setValue(1)
+        self.thread_spin.setRange(1, 8)
+        self.thread_spin.setValue(4)
+        self.thread_spin.setToolTip("并行处理的目录数(1-8)")
         
         self.dpi_spin = QSpinBox()
         self.dpi_spin.setRange(72, 1200)
@@ -2526,10 +3829,9 @@ class JpgToPdfPage(FunctionPage):
             "功能说明：\n"
             "• 扫描目录及子目录下所有JPG文件\n"
             "• 每个目录的JPG合并为一个PDF\n"
-            "• 调用Umi-OCR生成双层PDF（可搜索）\n"
+            "• 使用内置本地OCR(与分件功能同款)生成双层PDF(可搜索/可选中)\n"
             "• PDF文件名与目录名相同\n"
-            "• 可选：同时在PDF目录中生成同名OFD文件\n"
-            "• 注意：需要先启动Umi-OCR程序"
+            "• 可选：同时在PDF目录中生成同名OFD文件"
         )
         info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
         self.layout.addWidget(info_label)
@@ -2569,12 +3871,23 @@ class JpgToPdfPage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择图片目录")
         if d:
             self.img_dir.setText(d)
-            if not self.out_dir.text():
-                self.out_dir.setText(d)
-    
+            # 输出目录未手动改过时, 自动跟随源目录 → 源目录\PDF
+            self._auto_out_dir()
+
+    def _auto_out_dir(self):
+        """输出目录自动联动: 用户未手动改过时, 跟随源目录生成「源目录/PDF」;
+        手动选择过其他输出目录后不再跟随。"""
+        if getattr(self, '_out_manual', False):
+            return
+        base = self.img_dir.text().strip()
+        if base:
+            self.out_dir.setText(os.path.join(base, "PDF"))
+
     def browse_out_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
-        if d: self.out_dir.setText(d)
+        if d:
+            self.out_dir.setText(d)
+            self._out_manual = True  # 手动指定后不再跟随源目录
     
     def preview_operations(self):
         """预览将要执行的操作"""
@@ -2638,23 +3951,28 @@ class JpgToPdfPage(FunctionPage):
         if not d:
             QMessageBox.warning(self, "提示", "请先选择图片目录")
             return
-        
+
         if not out:
             QMessageBox.warning(self, "提示", "请先选择输出目录")
             return
-        
+
         if not os.path.exists(d):
             QMessageBox.warning(self, "错误", "图片目录不存在")
             return
-        
+
+        # 输出目录不存在 → 点击开始时自动创建
         if not os.path.exists(out):
-            QMessageBox.warning(self, "错误", "输出目录不存在")
-            return
-        
+            try:
+                os.makedirs(out, exist_ok=True)
+                self.log(f"输出目录不存在, 已自动创建: {out}")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法创建输出目录: {e}")
+                return
+
         # 确认操作
         reply = QMessageBox.question(
             self, "确认操作",
-            "确定要开始转换吗？\n\n注意：需要先启动Umi-OCR程序！",
+            "确定要开始转换吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -3034,10 +4352,14 @@ class PdfToOfdPage(FunctionPage):
         if not os.path.exists(d):
             QMessageBox.warning(self, "错误", "PDF源目录不存在")
             return
-        
+
+        # OFD输出目录不存在 → 点击开始时自动创建
         if not os.path.exists(out):
-            QMessageBox.warning(self, "错误", "OFD输出目录不存在")
-            return
+            try:
+                os.makedirs(out, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法创建OFD输出目录: {e}")
+                return
         
         # 确认操作
         reply = QMessageBox.question(
@@ -3128,18 +4450,33 @@ class FileSplitPage(FunctionPage):
         h.addWidget(btn_browse)
         form.addRow("分件目录:", h)
 
+        # 分件到新目录(缺省选中): 结果按目录结构拷贝到目标目录, 源不动
+        self._target_manual = False  # 用户是否手动改过目标目录(改过则不随源联动)
+        self.to_new_check = QCheckBox("分件到新目录(拷贝到目标目录, 源文件不动)")
+        self.to_new_check.setChecked(True)
+        self.to_new_check.stateChanged.connect(self.on_to_new_toggled)
+        form.addRow("分件方式:", self.to_new_check)
+
+        self.target_edit = QLineEdit()
+        self.target_edit.setPlaceholderText("分件结果输出目录")
+        btn_target = QPushButton("选择文件夹")
+        btn_target.setObjectName("BrowseBtn")
+        btn_target.clicked.connect(self.browse_target)
+        h2 = QHBoxLayout()
+        h2.addWidget(self.target_edit)
+        h2.addWidget(btn_target)
+        self.btn_target = btn_target
+        form.addRow("目标目录:", h2)
+
         group.setLayout(form)
         self.layout.addWidget(group)
 
         # 说明
         info = QLabel(
             "功能说明：\n"
-            "• 对所选目录下每个子目录：取 0001/0002 两页，OCR 第2页\n"
-            "• 第2页标题为「卷内文件目录」时，解析序号、页号列(如 1-17)\n"
-            "• 按序号建子目录(目录名-0001)，页号+2 为文件名移动对应 jpg\n"
-            "• 建「目录名+备考表卷底」「目录名+卷皮目录」两个子目录\n"
-            "• 0001/0002 → 卷皮目录；最大与次大文件 → 备考表卷底\n"
-            "• 详细日志保存在所选目录下"
+            "• 自动分件: 对每个子目录 OCR 第2页(卷内文件目录)，解析序号/页号自动拆分\n"
+            "• 检查: 复用分件OCR解析标准检查各目录，发现应移走却残留的文件并生成报告\n"
+            "• 手工分件: 逐个目录手工输入序号/页号拆分(带连续性校验)"
         )
         info.setStyleSheet("color: #666; font-size: 12px;")
         self.layout.addWidget(info)
@@ -3150,6 +4487,14 @@ class FileSplitPage(FunctionPage):
         self.start_btn.setObjectName("ActionBtn")
         self.start_btn.clicked.connect(self.start)
         btn_layout.addWidget(self.start_btn)
+        self.check_btn = QPushButton("检查")
+        self.check_btn.setObjectName("ActionBtn")
+        self.check_btn.clicked.connect(self.start_check)
+        btn_layout.addWidget(self.check_btn)
+        self.manual_btn = QPushButton("手工分件")
+        self.manual_btn.setObjectName("ActionBtn")
+        self.manual_btn.clicked.connect(self.start_manual)
+        btn_layout.addWidget(self.manual_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setObjectName("ActionBtn")
         self.stop_btn.setStyleSheet("background-color: #DA3633; color: white;")
@@ -3175,9 +4520,34 @@ class FileSplitPage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择分件目录")
         if d:
             self.dir_edit.setText(d)
+            # 源目录变化: 目标目录未手动改过时自动跟随(源/分件完成)
+            self._auto_target()
+
+    def _auto_target(self):
+        """目标目录自动联动: 用户未手动改过目标目录时, 跟随源目录生成
+        「源目录/分件完成」; 手动改过(选择过其他目录)后不再跟随。"""
+        if getattr(self, '_target_manual', False):
+            return
+        base = self.dir_edit.text().strip()
+        if base:
+            self.target_edit.setText(os.path.join(base, "分件完成"))
 
     def log(self, msg):
         self.log_box.append(f">> {msg}")
+
+    def on_to_new_toggled(self, state):
+        """「分件到新目录」勾选状态切换: 取消时禁编目标目录。"""
+        to_new = self.to_new_check.isChecked()
+        self.target_edit.setEnabled(to_new)
+        self.btn_target.setEnabled(to_new)
+        if to_new:
+            self._auto_target()  # 目标为空或未手动改过 → 自动填默认
+
+    def browse_target(self):
+        d = QFileDialog.getExistingDirectory(self, "选择分件结果输出目录")
+        if d:
+            self.target_edit.setText(d)
+            self._target_manual = True  # 用户手动指定, 之后不再跟随源目录
 
     def start(self):
         base_dir = self.dir_edit.text().strip()
@@ -3188,17 +4558,38 @@ class FileSplitPage(FunctionPage):
             QMessageBox.warning(self, "错误", "目录不存在")
             return
 
-        reply = QMessageBox.question(
-            self, "确认操作",
-            "分件将移动所选目录下的 jpg 文件(不可自动撤销)，\n"
-            "建议先备份。确定开始吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        to_new = self.to_new_check.isChecked()
+        target_base = None
+        copy_mode = False
+        if to_new:
+            target_base = self.target_edit.text().strip()
+            if not target_base:
+                target_base = os.path.join(base_dir, "分件完成")
+                self.target_edit.setText(target_base)
+            try:
+                os.makedirs(target_base, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法创建目标目录: {e}")
+                return
+            copy_mode = True
+
+        if copy_mode:
+            confirm_msg = (f"分件结果将拷贝到:\n{target_base}\n"
+                           f"(源目录文件保持不动)")
+        else:
+            confirm_msg = ("分件将在源目录内移动 jpg 文件(不可自动撤销)，\n"
+                           "建议先备份。确定开始吗？")
+        reply = QMessageBox.question(self, "确认操作", confirm_msg,
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
 
         self.log_box.clear()
         self.log(f"开始分件: {base_dir}")
-        self.worker = FileSplitWorker(base_dir)
+        if copy_mode:
+            self.log(f"分件到新目录(拷贝): {target_base}")
+        self.worker = FileSplitWorker(base_dir, target_base=target_base,
+                                      copy_mode=copy_mode)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_finished)
@@ -3226,44 +4617,45 @@ class FileSplitPage(FunctionPage):
         else:
             QMessageBox.warning(self, "结束", message)
 
+    # ---------- 检查 ----------
+    def start_check(self):
+        base_dir = self.dir_edit.text().strip()
+        if not base_dir:
+            QMessageBox.warning(self, "提示", "请先选择目录")
+            return
+        if not os.path.isdir(base_dir):
+            QMessageBox.warning(self, "错误", "目录不存在")
+            return
 
-class SettingsPage(FunctionPage):
-    def __init__(self):
-        super().__init__("参数设置")
-        group = QGroupBox("系统全局参数配置")
-        form = QFormLayout()
+        self.log_box.clear()
+        self.log(f"开始检查: {base_dir}")
+        self.check_worker = FileSplitCheckWorker(base_dir)
+        self.check_worker.log_signal.connect(self.log)
+        self.check_worker.progress_signal.connect(self.update_progress)
+        self.check_worker.finished_signal.connect(self.on_check_finished)
+        self.check_worker.start()
+        self.check_btn.setEnabled(False)
 
-        self.work_dir = QLineEdit(os.getcwd())
-        btn_browse = QPushButton("浏览")
-        btn_browse.setObjectName("BrowseBtn")
-        btn_browse.clicked.connect(
-            lambda: self.work_dir.setText(QFileDialog.getExistingDirectory(self, "选择工作目录")))
-        h1 = QHBoxLayout();
-        h1.addWidget(self.work_dir);
-        h1.addWidget(btn_browse)
+    def on_check_finished(self, success, message):
+        self.log(message)
+        self.progress.setFormat("检查完成" if success else "检查停止/失败")
+        self.check_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "检查完成", message)
+        else:
+            QMessageBox.warning(self, "检查结束", message)
 
-        self.thread_num = QSpinBox();
-        self.thread_num.setValue(4)
-        self.log_level = QComboBox();
-        self.log_level.addItems(["INFO", "DEBUG", "ERROR"])
-
-        form.addRow("默认工作目录:", h1)
-        form.addRow("并发线程数:", self.thread_num)
-        form.addRow("日志级别:", self.log_level)
-        group.setLayout(form)
-        self.layout.addWidget(group)
-
-        btn_save = QPushButton("保存配置")
-        btn_save.setObjectName("ActionBtn")
-        btn_save.clicked.connect(self.execute)
-        self.layout.addWidget(btn_save)
-        self.add_log_widget()
-
-    def execute(self):
-        self.log("配置写入 config.ini 成功！")
-        self.log(f"工作目录: {self.work_dir.text()}")
-        self.log(f"线程数: {self.thread_num.value()}")
-
+    # ---------- 手工分件 ----------
+    def start_manual(self):
+        base_dir = self.dir_edit.text().strip()
+        if not base_dir:
+            QMessageBox.warning(self, "提示", "请先选择目录")
+            return
+        if not os.path.isdir(base_dir):
+            QMessageBox.warning(self, "错误", "目录不存在")
+            return
+        dlg = ManualSplitDialog(base_dir, self)
+        dlg.exec_()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -3292,9 +4684,9 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(title)
 
-        # 菜单按钮配置 (去除了重复的"文件改名")
+        # 菜单按钮配置 (已移除"参数设置")
         menus = ["文件改名", "自动编页码", "文件移动", "加盖归档章",
-                 "修改DPI", "JPG转双层PDF", "PDF转OFD", "分件", "参数设置"]
+                 "修改DPI", "JPG转双层PDF", "PDF转OFD", "分件"]
 
         self.menu_buttons = []
         for m in menus:
@@ -3324,8 +4716,7 @@ class MainWindow(QMainWindow):
             "修改DPI": ModifyDpiPage(),
             "JPG转双层PDF": JpgToPdfPage(),
             "PDF转OFD": PdfToOfdPage(),
-            "分件": FileSplitPage(),
-            "参数设置": SettingsPage()
+            "分件": FileSplitPage()
         }
 
         for name in menus:
