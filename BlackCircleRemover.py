@@ -1434,7 +1434,7 @@ class BlackCircleRemoverPage(QWidget):
         'bg_dark': '#0D1117', 'border': '#30363D', 'view_bg': '#1a1a2e',
     }
     _LIGHT_COLORS = {
-        'accent': '#1a5276', 'text': '#2c3e50', 'secondary': '#7f8c8d',
+        'accent': '#1565C0', 'text': '#1c2833', 'secondary': '#5d6d7e',
         'bg_dark': '#ffffff', 'border': '#bdc3c7', 'view_bg': '#d5dbdb',
     }
 
@@ -1665,17 +1665,22 @@ class BlackCircleRemoverPage(QWidget):
         self.info_label.setStyleSheet(f"color: {colors['secondary']}; font-size: 14px;")
         # 更新文件浏览器标题颜色
         self.tree_label.setStyleSheet(f"color: {colors['accent']}; font-weight: bold; padding: 2px;")
-        # 更新文件树样式
+        # 更新文件树样式(文件名文字: 浅色主题用深黑加大字号)
+        _tree_fs = 15 if self._current_theme == 'light' else 13
         self.file_tree.setStyleSheet(
             f"QTreeWidget {{ background-color: {colors['bg_dark']}; border: 1px solid {colors['border']};"
-            f" border-radius: 3px; font-size: 13px; color: {colors['text']}; }}"
+            f" border-radius: 3px; font-size: {_tree_fs}px; color: {colors['text']}; }}"
             f"QTreeWidget::item {{ padding: 3px; }}"
             f"QTreeWidget::item:selected {{ background-color: #1F6FEB; color: white; }}")
-        # 更新树节点颜色
+        # 更新树节点颜色: 目录行(顶层项)加深+加粗, 与文件名区分
+        _dir_color = '#0e2f44' if self._current_theme == 'light' else colors['accent']
         root = self.file_tree.invisibleRootItem()
         for i in range(root.childCount()):
             dir_item = root.child(i)
-            dir_item.setForeground(0, QColor(colors['accent']))
+            _f = dir_item.font(0)
+            _f.setBold(True)
+            dir_item.setFont(0, _f)
+            dir_item.setForeground(0, QColor(_dir_color))
         # 更新预览面板样式
         for panel in [self.before_panel, self.after_panel]:
             panel.header.setStyleSheet(
@@ -1747,7 +1752,10 @@ class BlackCircleRemoverPage(QWidget):
                     continue
                 dir_item = QTreeWidgetItem(self.file_tree)
                 dir_item.setText(0, f"📁 {sub} ({count})")
-                dir_item.setForeground(0, QColor("#00F0FF"))
+                _dir_font = dir_item.font(0)
+                _dir_font.setBold(True)
+                dir_item.setFont(0, _dir_font)
+                dir_item.setForeground(0, QColor('#00F0FF' if self._current_theme == 'dark' else '#0e2f44'))
                 dir_item.setData(0, Qt.UserRole, ("dir", sub_path))
                 for fp in sub_files:
                     file_item = QTreeWidgetItem(dir_item)
@@ -1762,7 +1770,7 @@ class BlackCircleRemoverPage(QWidget):
             if root_jpgs:
                 root_item = QTreeWidgetItem(self.file_tree)
                 root_item.setText(0, f"📁 根目录 ({len(root_jpgs)})")
-                root_item.setForeground(0, QColor("#00F0FF"))
+                root_item.setForeground(0, QColor('#00F0FF' if self._current_theme == 'dark' else self._LIGHT_COLORS['accent']))
                 root_item.setData(0, Qt.UserRole, ("dir", root_dir))
                 for fp in root_jpgs:
                     file_item = QTreeWidgetItem(root_item)
