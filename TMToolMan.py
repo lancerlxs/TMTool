@@ -234,6 +234,10 @@ class FileSplitWorker(QThread):
         self.xlsx_dir = xlsx_dir          # 目录文件(xlsx)所在根目录(None=OCR模式)
         self.is_stopped = False
         self._ocr = None  # PaddleOCR 延迟初始化(只初始化一次, 避免重复加载模型)
+        import threading as _th
+        self._ocr_init_lock = _th.Lock()   # 初始化锁: 多线程(JPG转PDF默认4线程)并发
+                                           # 首次调用时防止同时构造多个PaddleOCR实例
+                                           # (并发构造会内存暴涨/死锁——低配机卡死根因)
 
     # ---------- OCR ----------
     def _get_ocr(self):
@@ -243,55 +247,104 @@ class FileSplitWorker(QThread):
         联网下载模型(内网环境会静默失败导致 OCR 无结果)。
         """
         if self._ocr is None:
+            # 双重检查锁: 拿到锁后再次确认(可能已被前一个线程初始化完)
+            _lock = getattr(self, '_ocr_init_lock', None)
+            if _lock is not None:
+                _lock.acquire()
             try:
-                from paddleocr import PaddleOCR
-                self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
-                # 模型目录定位: PyInstaller 打包后资源在 sys._MEIPASS; 开发环境在脚本目录
-                base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-                m_det = os.path.join(base, 'ocr_models', 'det')
-                m_rec = os.path.join(base, 'ocr_models', 'rec')
-                m_cls = os.path.join(base, 'ocr_models', 'cls')
-                has_models = all(os.path.exists(os.path.join(m, 'inference.pdmodel'))
-                                 for m in (m_det, m_rec, m_cls))
-                import warnings as _w
-                _w.filterwarnings('ignore', message='.*use_angle_cls.*deprecated.*')
-                # paddleocr 版本碎片化兼容: 依次尝试多组配置, 成功即用。
-                # 覆盖: 2.x(全参数) / 3.x legacy(use_angle_cls 可用但 show_log 移除)
-                #       / 3.x 新参数(仅无内置模型时; 会走联网下载, 内网可能失败)
-                configs = []
-                if has_models:
-                    configs += [
-                        # 2.x 标准配置
-                        dict(use_angle_cls=True, lang='ch', show_log=False,
-                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
-                        # 3.x legacy: use_angle_cls 被兼容, 但 show_log 已移除
-                        dict(use_angle_cls=True, lang='ch',
-                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
-                        # 3.x 新参数 + 旧模型路径(部分版本参数改名但模型格式仍兼容)
-                        dict(use_textline_orientation=True, lang='ch',
-                             det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
-                    ]
+                if self._ocr is not None:
+                    return self._ocr
+                self._init_ocr_locked()
+            finally:
+                if _lock is not None:
+                    _lock.release()
+        return self._ocr
+
+    def _init_ocr_locked(self):
+        """在持有初始化锁的状态下构造 PaddleOCR(仅 _get_ocr 内部调用)。"""
+        try:
+            from paddleocr import PaddleOCR
+            self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
+            # 模型目录定位: PyInstaller 打包后资源在 sys._MEIPASS; 开发环境在脚本目录
+            base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+            m_det = os.path.join(base, 'ocr_models', 'det')
+            m_rec = os.path.join(base, 'ocr_models', 'rec')
+            m_cls = os.path.join(base, 'ocr_models', 'cls')
+            has_models = all(os.path.exists(os.path.join(m, 'inference.pdmodel'))
+                             for m in (m_det, m_rec, m_cls))
+            import warnings as _w
+            _w.filterwarnings('ignore', message='.*use_angle_cls.*deprecated.*')
+            # GPU OCR 请求检测: 双条件——paddle编译了CUDA支持 且 检测到GPU设备。
+            # 仅编译支持但无卡(如GPU版paddle装在无NVIDIA机器)时 use_gpu=True 会
+            # 报「Device id must be less than GPU count」→ 预检回退CPU。
+            want_gpu = bool(getattr(self, 'use_gpu_ocr', False))
+            gpu_ok = False
+            if want_gpu:
+                _pd = None
+                try:
+                    import paddle as _pd
+                    compiled = bool(_pd.device.is_compiled_with_cuda())
+                    n_gpu = int(_pd.device.cuda.device_count()) if compiled else 0
+                    gpu_ok = compiled and n_gpu > 0
+                except Exception:
+                    gpu_ok = False
+                if gpu_ok:
+                    self.log_signal.emit("  OCR使用GPU推理(paddlepaddle-gpu, "
+                                         f"{n_gpu}个GPU设备)")
+                else:
+                    self.log_signal.emit("  × GPU不可用(未装GPU版paddle或无NVIDIA设备)"
+                                         " → 回退CPU推理(结果相同)")
+                    # GPU版paddle装在无卡机上时, paddle默认找GPU设备会报
+                    # 「Device id must be less than GPU count」——强制切CPU
+                    if _pd is not None:
+                        try:
+                            _pd.set_device('cpu')
+                        except Exception:
+                            pass
+            # paddleocr 版本碎片化兼容: 依次尝试多组配置, 成功即用。
+            # 覆盖: 2.x(全参数) / 3.x legacy(use_angle_cls 可用但 show_log 移除)
+            #       / 3.x 新参数(仅无内置模型时; 会走联网下载, 内网可能失败)
+            # GPU 模式: 每组配置附加 use_gpu=True(2.x 参数; 3.x 由 paddle 自行调度)
+            # 注意: paddleocr 2.7 的 use_gpu 参数【默认是 True】(utility.py)。
+            # GPU版paddle在无卡机上必须显式 use_gpu=False 覆盖默认,
+            # 否则即使不带参数也按GPU初始化而报错。
+            _gpu_kw = dict(use_gpu=True) if (want_gpu and gpu_ok) else dict(use_gpu=False)
+            configs = []
+            if has_models:
                 configs += [
-                    dict(use_angle_cls=True, lang='ch', show_log=False),
-                    dict(use_angle_cls=True, lang='ch'),
-                    dict(use_textline_orientation=True),
-                    dict(),
+                    # 2.x 标准配置
+                    dict(use_angle_cls=True, lang='ch', show_log=False,
+                         det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls,
+                         **_gpu_kw),
+                    # 3.x legacy: use_angle_cls 被兼容, 但 show_log 已移除
+                    dict(use_angle_cls=True, lang='ch',
+                         det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls,
+                         **_gpu_kw),
+                    # 3.x 新参数 + 旧模型路径(部分版本参数改名但模型格式仍兼容)
+                    dict(use_textline_orientation=True, lang='ch',
+                         det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
                 ]
-                last_err = None
-                for i, kw in enumerate(configs, 1):
-                    try:
-                        self._ocr = PaddleOCR(**kw)
-                        self.log_signal.emit(f"  (OCR初始化成功: 配置#{i}"
-                                             f"{' 含内置模型' if 'det_model_dir' in kw else ''})")
-                        break
-                    except Exception as e:
-                        last_err = e
-                        self.log_signal.emit(f"  (配置#{i} 不适用: {str(e)[:80]}, 尝试下一配置)")
-                if self._ocr is None:
-                    raise last_err or RuntimeError('所有OCR配置均失败')
-            except Exception as e:
-                self.log_signal.emit(f"  × PaddleOCR 初始化失败: {e}")
-                return None
+            configs += [
+                dict(use_angle_cls=True, lang='ch', show_log=False, **_gpu_kw),
+                dict(use_angle_cls=True, lang='ch', **_gpu_kw),
+                dict(use_textline_orientation=True),
+                dict(),
+            ]
+            last_err = None
+            for i, kw in enumerate(configs, 1):
+                try:
+                    self._ocr = PaddleOCR(**kw)
+                    self.log_signal.emit(f"  (OCR初始化成功: 配置#{i}"
+                                         f"{' 含内置模型' if 'det_model_dir' in kw else ''})")
+                    break
+                except Exception as e:
+                    last_err = e
+                    self.log_signal.emit(f"  (配置#{i} 不适用: {str(e)[:80]}, 尝试下一配置)")
+            if self._ocr is None:
+                raise last_err or RuntimeError('所有OCR配置均失败')
+        except Exception as e:
+            self.log_signal.emit(f"  × PaddleOCR 初始化失败: {e}")
+            return None
         return self._ocr
 
     def _ocr_page(self, image_path, logf, wlog):
@@ -1314,6 +1367,24 @@ class FileSplitWorker(QThread):
 
     def run(self):
         try:
+            # GPU环境预处理(必须在 paddle 首次导入之前执行):
+            # 装了GPU版paddle但机器无NVIDIA卡时, paddle导入即锁定找GPU设备,
+            # 之后任何配置都报「Device id must be less than GPU count」。
+            # 用 ctypes 检测 nvcuda.dll(不导入paddle): 无卡则屏蔽CUDA设备,
+            # 让paddle全程走纯CPU(用户勾选GPU时同样只能回退, 日志已提示)。
+            try:
+                if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+                    import ctypes as _ct
+                    try:
+                        _ct.CDLL('nvcuda.dll')
+                        _has_nvidia = True
+                    except OSError:
+                        _has_nvidia = False
+                    if not _has_nvidia:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            except Exception:
+                pass
+
             if not os.path.isdir(self.base_dir):
                 self.finished_signal.emit(False, "所选目录不存在")
                 return
@@ -2020,16 +2091,72 @@ class ManualSplitDialog(QDialog):
                 self.close()
 
 
+# ---------------- 文件改名记录数据库(sqlite) ----------------
+_RENAME_DB_NAME = 'rename_modified_records.db'
+
+def _rename_db_path():
+    """记录库固定放在程序目录(独立于处理目录, 跨次累积)。"""
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, _RENAME_DB_NAME)
+
+def _rename_db_init(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS renamed_files (
+        src_path TEXT NOT NULL,
+        src_name TEXT NOT NULL,
+        new_name TEXT,
+        renamed_at TEXT,
+        PRIMARY KEY (src_path, src_name))""")
+    conn.commit()
+
+def _rename_db_record_many(records):
+    """批量写入改名记录(原路径+原名→新名)。失败静默。"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(_rename_db_path())
+        try:
+            _rename_db_init(conn)
+            conn.executemany(
+                "INSERT OR REPLACE INTO renamed_files VALUES (?,?,?,?)",
+                [(r['src_path'], r['src_name'], r.get('new_name', ''),
+                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                 for r in records])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+def _rename_db_processed_set():
+    """已记录改名的 (原路径, 原文件名) 集合。"""
+    import sqlite3
+    try:
+        if not os.path.exists(_rename_db_path()):
+            return set()
+        conn = sqlite3.connect(_rename_db_path())
+        try:
+            rows = conn.execute("SELECT src_path, src_name FROM renamed_files").fetchall()
+            return {(r[0].lower(), r[1].lower()) for r in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
+
 class FileRenameWorker(QThread):
     """文件重命名后台处理线程"""
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
     finished_signal = Signal(bool, str)
-    
-    def __init__(self, base_dir, modify_dpi=False, parent=None):
+
+    def __init__(self, base_dir, modify_dpi=False, only_new=False, parent=None):
         super().__init__(parent)
         self.base_dir = base_dir
         self.modify_dpi = modify_dpi  # 是否修改JPG文件的DPI为600
+        self.only_new = only_new      # 只修改新增: 与记录(原路径+原文件名)相同的跳过
         self.is_stopped = False
     
     def run(self):
@@ -2047,14 +2174,31 @@ class FileRenameWorker(QThread):
             subdirs = [d for d in Path(self.base_dir).iterdir() if d.is_dir()]
             total_dirs = len(subdirs)
             processed_dirs = 0
-            
+            skipped_new = 0
+            ok_records = []   # 改名成功记录 → sqlite
+
+            # 只修改新增: 加载历史记录集(原路径+原文件名)
+            done_set = _rename_db_processed_set() if self.only_new else set()
+            if self.only_new and done_set:
+                self.log_signal.emit(f"「只修改新增」: 已加载 {len(done_set)} 条历史改名记录")
+
             for subdir in subdirs:
                 if self.is_stopped:
                     break
-                
+
                 # 获取子目录中的所有文件
                 files = [f for f in subdir.iterdir() if f.is_file()]
-                
+
+                # 只修改新增: 与历史记录(原路径+原文件名)完全相同的文件跳过
+                if self.only_new and done_set and files:
+                    before = len(files)
+                    files = [f for f in files
+                             if (str(f.parent).lower(), f.name.lower()) not in done_set]
+                    n_skip = before - len(files)
+                    if n_skip:
+                        skipped_new += n_skip
+                        self.log_signal.emit(f"  跳过已改名的文件 {n_skip} 个({subdir.name})")
+
                 if not files:
                     processed_dirs += 1
                     continue
@@ -2083,7 +2227,10 @@ class FileRenameWorker(QThread):
                     try:
                         file.rename(new_name)
                         results["renamed_files"] += 1
-                        
+                        ok_records.append({'src_path': str(file.parent),
+                                           'src_name': file.name,
+                                           'new_name': new_name.name})
+
                         # 如果需要修改DPI且是JPG文件，则修改DPI
                         if self.modify_dpi and new_name.suffix.lower() in ['.jpg', '.jpeg']:
                             try:
@@ -2104,7 +2251,7 @@ class FileRenameWorker(QThread):
                         log_entry["success"] = False
                         log_entry["error_msg"] = error_msg
                         self.log_signal.emit(f"错误: {error_msg}")
-                    
+
                     results["log_entries"].append(log_entry)
                 else:
                     # 如果有多个文件，则使用递增后缀
@@ -2131,6 +2278,9 @@ class FileRenameWorker(QThread):
                         try:
                             file.rename(new_name)
                             results["renamed_files"] += 1
+                            ok_records.append({'src_path': str(file.parent),
+                                               'src_name': file.name,
+                                               'new_name': new_name.name})
                             
                             # 如果需要修改DPI且是JPG文件，则修改DPI
                             if self.modify_dpi and new_name.suffix.lower() in ['.jpg', '.jpeg']:
@@ -2160,6 +2310,11 @@ class FileRenameWorker(QThread):
                 self.progress_signal.emit(processed_dirs, total_dirs)
             
             if not self.is_stopped:
+                # 改名成功记录写入本地数据库(供「只修改新增」判重)
+                if ok_records:
+                    _rename_db_record_many(ok_records)
+                    self.log_signal.emit(
+                        f"已记录 {len(ok_records)} 个改名文件到本地数据库({_RENAME_DB_NAME})")
                 # 创建日志文件
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 log_filename = f"rename_log_{timestamp}.txt"
@@ -2186,9 +2341,10 @@ class FileRenameWorker(QThread):
                 
                 success_count = results['renamed_files']
                 fail_count = results['failed_files']
-                self.finished_signal.emit(True, 
+                skip_info = f", 跳过已记录: {skipped_new}" if skipped_new else ""
+                self.finished_signal.emit(True,
                     f"处理完成！总计: {results['processed_dirs']} 个目录, "
-                    f"成功: {success_count}, 失败: {fail_count}\n日志: {log_filename}")
+                    f"成功: {success_count}, 失败: {fail_count}{skip_info}\n日志: {log_filename}")
             else:
                 self.finished_signal.emit(False, "处理已停止")
                 
@@ -3713,6 +3869,62 @@ def _dpi_finalize_log(log_path, stats):
         pass
 
 
+# ---------------- DPI修改记录数据库(sqlite) ----------------
+_DPI_DB_NAME = 'dpi_modified_records.db'
+
+def _dpi_db_path():
+    """记录库固定放在程序目录(独立于处理目录, 跨次累积)。"""
+    base = getattr(sys, '_MEIPASS', None)  # exe运行时不可写, 用exe所在目录
+    if base:  # PyInstaller onefile: _MEIPASS是临时解压目录 → 放exe旁
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, _DPI_DB_NAME)
+
+def _dpi_db_init(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS modified_files (
+        file_path TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        dpi INTEGER,
+        modified_at TEXT,
+        PRIMARY KEY (file_path, file_name))""")
+    conn.commit()
+
+def _dpi_db_record_many(records):
+    """批量写入修改记录(路径+文件名+DPI)。失败静默(不影响主流程)。"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(_dpi_db_path())
+        try:
+            _dpi_db_init(conn)
+            conn.executemany(
+                "INSERT OR REPLACE INTO modified_files VALUES (?,?,?,?)",
+                [(r['file_path'], os.path.basename(r['file_path']),
+                  r.get('dpi', 0),
+                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                 for r in records])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+def _dpi_db_processed_set():
+    """已记录修改的 (路径, 文件名) 集合。库不存在/异常返回空集。"""
+    import sqlite3
+    try:
+        if not os.path.exists(_dpi_db_path()):
+            return set()
+        conn = sqlite3.connect(_dpi_db_path())
+        try:
+            rows = conn.execute("SELECT file_path, file_name FROM modified_files").fetchall()
+            return {(r[0].lower(), r[1].lower()) for r in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
+
 def _dpi_process_single_file(file_path, dpi, dry_run, stop_event=None):
     """处理单个 JPG：读取原 DPI，按需重写为 dpi（仅改 DPI，不改像素）。"""
     start = time.time()
@@ -3754,12 +3966,13 @@ class ModifyDpiWorker(QThread):
     progress_signal = Signal(int, int)      # (已完成, 总数)
     finished_signal = Signal(bool, str)     # (是否正常完成, 汇总信息)
 
-    def __init__(self, base_dir, dpi=600, dry_run=False, max_workers=4, parent=None):
+    def __init__(self, base_dir, dpi=600, dry_run=False, max_workers=4, only_new=False, parent=None):
         super().__init__(parent)
         self.base_dir = base_dir
         self.dpi = dpi
         self.dry_run = dry_run
         self.max_workers = max_workers
+        self.only_new = only_new      # 只修改新增: 与历史记录(路径+文件名)完全相同的跳过
         self.is_stopped = False
         self.stop_event = threading.Event()
 
@@ -3778,9 +3991,25 @@ class ModifyDpiWorker(QThread):
                 for f in files:
                     if f.lower().endswith(('.jpg', '.jpeg')):
                         jpg_files.append(os.path.join(root, f))
+
+            # 只修改新增: 与历史记录(路径+文件名)完全相同的文件跳过
+            skipped = 0
+            if self.only_new and not self.dry_run:
+                done_set = _dpi_db_processed_set()
+                if done_set:
+                    before = len(jpg_files)
+                    jpg_files = [fp for fp in jpg_files
+                                 if (fp.lower(), os.path.basename(fp).lower()) not in done_set]
+                    skipped = before - len(jpg_files)
+                    if skipped:
+                        self.log_signal.emit(f"「只修改新增」: 跳过已记录修改过的文件 {skipped} 个")
+
             total = len(jpg_files)
             if total == 0:
-                self.finished_signal.emit(False, f"目录 {self.base_dir} 下未找到 JPG/JPEG 文件")
+                msg = f"目录 {self.base_dir} 下未找到 JPG/JPEG 文件"
+                if skipped:
+                    msg += f"（{skipped} 个已记录文件被「只修改新增」跳过）"
+                self.finished_signal.emit(False, msg)
                 return
 
             mode = "模拟运行" if self.dry_run else "实际修改"
@@ -3799,6 +4028,7 @@ class ModifyDpiWorker(QThread):
             done = 0
             success = 0
             errors = []
+            ok_records = []   # 实际修改成功的文件 → 写入sqlite记录
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_to_file = {
@@ -3829,6 +4059,9 @@ class ModifyDpiWorker(QThread):
                     done += 1
                     if res.get('success'):
                         success += 1
+                        if not self.dry_run:
+                            res['dpi'] = self.dpi
+                            ok_records.append(res)
                     else:
                         errors.append(f"{os.path.basename(fp)}: {res.get('error', '')}")
                     self.progress_signal.emit(done, total)
@@ -3836,11 +4069,17 @@ class ModifyDpiWorker(QThread):
             _dpi_finalize_log(log_path, {'processed_files': done,
                                          'modified_files': success, 'errors': errors})
 
+            # 实际修改成功的文件写入记录库(供「只修改新增」判重)
+            if ok_records:
+                _dpi_db_record_many(ok_records)
+                self.log_signal.emit(f"已记录 {len(ok_records)} 个修改文件到本地数据库({_DPI_DB_NAME})")
+
             if self.is_stopped:
                 self.finished_signal.emit(False, f"已停止。已处理 {done}/{total}，成功 {success}。")
             else:
+                skip_info = f"，跳过已记录 {skipped} 个" if skipped else ""
                 self.finished_signal.emit(
-                    True, f"{mode}完成：共 {done} 个，成功 {success}，失败 {len(errors)}。日志：{log_path}")
+                    True, f"{mode}完成：共 {done} 个，成功 {success}，失败 {len(errors)}{skip_info}。日志：{log_path}")
         except Exception as e:
             self.finished_signal.emit(False, f"运行异常：{e}")
 
@@ -3880,10 +4119,18 @@ class ModifyDpiPage(FunctionPage):
 
         self.dry_run_cb = QCheckBox("模拟运行（仅预览将要执行的操作，不实际修改文件）")
 
+        # 只修改新增: 勾选后, 与本地记录库中「路径+文件名」完全相同的文件跳过
+        self.only_new_cb = QCheckBox("只修改新增（跳过已修改过的文件，按路径+文件名判重）")
+        self.only_new_cb.setChecked(False)
+        self.only_new_cb.setToolTip(
+            "程序在本地数据库记录每次实际修改过的文件(路径+文件名)。\n"
+            "勾选后，与历史记录完全相同的文件不再重复修改；未勾选则全部重新处理。")
+
         form.addRow("图片目录:", h1)
         form.addRow("目标DPI:", h_dpi)
         form.addRow("线程数:", self.thread_spin)
         form.addRow("", self.dry_run_cb)
+        form.addRow("", self.only_new_cb)
         group.setLayout(form)
         self.layout.addWidget(group)
 
@@ -3939,7 +4186,8 @@ class ModifyDpiPage(FunctionPage):
         self.progress.setValue(0)
         self.progress.setFormat("准备中...")
         self.worker = ModifyDpiWorker(directory, dpi=dpi, dry_run=dry_run,
-                                      max_workers=self.thread_spin.value())
+                                      max_workers=self.thread_spin.value(),
+                                      only_new=self.only_new_cb.isChecked())
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.finished_signal.connect(self._on_finished)
@@ -3999,17 +4247,21 @@ class JpgToPdfWorker(QThread):
     progress_signal = Signal(int, int)
     finished_signal = Signal(bool, str)
     
-    def __init__(self, directory_path, output_dir=None, max_workers=4, resolution=100.0, generate_ofd=False, parent=None):
+    def __init__(self, directory_path, output_dir=None, max_workers=4, resolution=100.0,
+                 generate_ofd=False, gpu_render=False, use_gpu_ocr=False, parent=None):
         super().__init__(parent)
         self.directory_path = directory_path
         self.output_dir = output_dir if output_dir else directory_path
         self.max_workers = max_workers
         self.resolution = resolution
         self.generate_ofd = generate_ofd  # 是否同时生成OFD文件
+        self.gpu_render = gpu_render      # GPU渲染: 图像加速路径(MKL-DNN+无损直传)
+        self.use_gpu_ocr = use_gpu_ocr    # OCR用GPU推理(不可用自动回退CPU)
         self.is_stopped = False
         import threading
         self._ofd_lock = threading.Lock()
         self._ocr_lock = threading.Lock()   # PaddleOCR 推理非线程安全, 串行化
+        self._ocr_init_lock = threading.Lock()  # OCR初始化锁(4线程并发首次初始化防重复构造)
         self._ocr = None  # PaddleOCR 延迟初始化(与分件共享同一初始化逻辑)
         
         # 检查 OFD 转换库是否可用（用于生成双层OFD）
@@ -4027,6 +4279,24 @@ class JpgToPdfWorker(QThread):
     
     def run(self):
         try:
+            # GPU环境预处理(必须在 paddle 首次导入之前执行):
+            # 装了GPU版paddle但机器无NVIDIA卡时, paddle导入即锁定找GPU设备,
+            # 之后任何配置都报「Device id must be less than GPU count」。
+            # 用 ctypes 检测 nvcuda.dll(不导入paddle): 无卡则屏蔽CUDA设备,
+            # 让paddle全程走纯CPU(用户勾选GPU时同样只能回退, 日志已提示)。
+            try:
+                if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+                    import ctypes as _ct
+                    try:
+                        _ct.CDLL('nvcuda.dll')
+                        _has_nvidia = True
+                    except OSError:
+                        _has_nvidia = False
+                    if not _has_nvidia:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            except Exception:
+                pass
+
             # 输出目录不存在则创建(缺省为 源目录/PDF, 可能尚不存在)
             if self.output_dir:
                 os.makedirs(self.output_dir, exist_ok=True)
@@ -4152,8 +4422,9 @@ class JpgToPdfWorker(QThread):
         
         return pdf_path
     
-    # 复用分件功能的本地 PaddleOCR(多配置兼容初始化+中文路径安全)
+    # 复用分件功能的本地 PaddleOCR(多配置兼容初始化+初始化锁+中文路径安全)
     _get_ocr = FileSplitWorker._get_ocr
+    _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _ocr_page = FileSplitWorker._ocr_page
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
 
@@ -4174,6 +4445,51 @@ class JpgToPdfWorker(QThread):
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
             return temp_pdf_path, "仅图像PDF（本地OCR不可用）"
 
+        # --- 首次推理看门狗: 构造成功≠能推理 ---
+        # 部分 3.x 环境构造(含旧模型路径)成功, 但首次 predict 时尝试联网
+        # 下载/校验模型 → 内网 requests 无超时 → 永久挂起(无异常无日志)。
+        # 用小图做一次 120s 超时探测: 失败则本目录降级为仅图像PDF, 不卡死。
+        # ★ 探测必须持有 ocr_lock(与其他线程的真实推理互斥)——paddle predictor
+        #   非线程安全, 并发调用会挂死(这正是"探测通过后再无动作"的原因)。
+        #   且用全局探测锁保证 4 线程只探测一次, 其余线程等待探测结果。
+        _probe_lock = getattr(self, '_probe_lock', None)
+        if _probe_lock is None:
+            import threading as _th
+            _probe_lock = _th.Lock()
+            self._probe_lock = _probe_lock
+        with _probe_lock:
+            if not getattr(self, '_ocr_probed', False):
+                import concurrent.futures as _cf
+                self._ocr_probed = True
+                self.log_signal.emit("  OCR引擎首次推理探测(最长等待120秒)...")
+                _probe = os.path.join(output_dir, '_ocr_probe.png')
+                _ocr_lock0 = getattr(self, '_ocr_lock', None)
+                try:
+                    Image.new('RGB', (400, 120), 'white').save(_probe)
+                    def _do_probe():
+                        if _ocr_lock0 is not None:
+                            with _ocr_lock0:
+                                return self._ocr_page(_probe, None, lambda s: None)
+                        return self._ocr_page(_probe, None, lambda s: None)
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                        _fut = _ex.submit(_do_probe)
+                        try:
+                            _fut.result(timeout=120)
+                            self.log_signal.emit("  OCR推理探测通过")
+                        except _cf.TimeoutError:
+                            self.log_signal.emit("  × OCR首次推理超时(120秒), "
+                                                 "本机OCR环境异常(可能尝试联网被内网阻塞)")
+                            self.log_signal.emit("  → 降级为仅图像PDF继续处理")
+                            self._ocr_broken = True
+                finally:
+                    try:
+                        os.remove(_probe)
+                    except Exception:
+                        pass
+        if getattr(self, '_ocr_broken', False):
+            temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
+            return temp_pdf_path, "仅图像PDF（本机OCR推理异常已跳过）"
+
         try:
             import fitz  # PyMuPDF
         except ImportError:
@@ -4183,26 +4499,45 @@ class JpgToPdfWorker(QThread):
         pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
         doc = fitz.open()
         ocr_lock = getattr(self, '_ocr_lock', None)
+        # GPU渲染模式: 启用 MKL-DNN 指令集加速(paddle的CPU加速路径, 有GPU时配合
+        # GPU OCR形成完整加速链)。生成结果与普通模式完全一致。
+        if getattr(self, 'gpu_render', False):
+            try:
+                import paddle
+                paddle.set_flags({'FLAGS_use_mkldnn': True})
+                self.log_signal.emit("  渲染加速已启用(MKL-DNN)")
+            except Exception:
+                pass
         try:
+            # 分段写盘: 超大目录(几百页)的 doc 若整体驻留, C++内存随页数线性增长,
+            # 4线程并行4个doc会累积到GB级导致进程被系统终止(无提示退出)。
+            # 每 CHUNK 页保存为分段PDF并释放doc, 最后合并 —— doc峰值恒定。
+            CHUNK = 50
+            seg_paths = []
+            page_no = 0
             for jpg_path in jpg_paths:
                 if self.is_stopped:
                     break
+                # 仅取尺寸(头信息), 不全量解码 → 每页省~26MB解码内存
                 img = Image.open(jpg_path)
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    img = img.convert('RGB')
                 w_px, h_px = img.size
+                img.close()
                 # PDF页面尺寸: 像素/分辨率*72 (resolution 默认100dpi)
                 w_pt = w_px * 72.0 / self.resolution
                 h_pt = h_px * 72.0 / self.resolution
                 page = doc.new_page(width=w_pt, height=h_pt)
                 page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), filename=jpg_path)
 
-                # OCR文本层(坐标从像素换算到PDF点)
+                # OCR文本层(坐标从像素换算到PDF点)——逐页日志, 挂起时可见最后处理到哪
+                self.log_signal.emit(f"    OCR: {os.path.basename(jpg_path)} "
+                                     f"({len(jpg_paths)}张中第{jpg_paths.index(jpg_path)+1}张)")
                 if ocr_lock is not None:
                     with ocr_lock:
                         frags = self._ocr_page(jpg_path, None, lambda s: None)
                 else:
                     frags = self._ocr_page(jpg_path, None, lambda s: None)
+                self.log_signal.emit(f"    OCR完成: {os.path.basename(jpg_path)} "
+                                     f"识别{len(frags)}片段")
                 sx = w_pt / w_px
                 sy = h_pt / h_px
                 for txt, x0, y0, x1, y1 in frags:
@@ -4257,8 +4592,32 @@ class JpgToPdfWorker(QThread):
                             except Exception:
                                 pass
                         cx += len(seg) * (fs if is_cn else fs * 0.5)
-            doc.save(pdf_path)
-            doc.close()
+
+                # 分段落盘: 每CHUNK页存为分段文件并新建空doc, 峰值内存恒定
+                page_no += 1
+                if page_no % CHUNK == 0 and page_no < len(jpg_paths):
+                    _seg = pdf_path + f'.part{page_no // CHUNK}'
+                    doc.save(_seg, garbage=3, deflate=True)
+                    doc.close()
+                    seg_paths.append(_seg)
+                    doc = fitz.open()  # 重置doc, C++侧旧内存随close释放
+
+            # 收尾: 存最后一段
+            if seg_paths:
+                _last = pdf_path + f'.part{len(seg_paths) + 1}'
+                doc.save(_last, garbage=3, deflate=True)
+                doc.close()
+                seg_paths.append(_last)
+                # 合并分段 → 最终PDF
+                merged = fitz.open()
+                for sp in seg_paths:
+                    merged.insert_pdf(fitz.open(sp))
+                    os.remove(sp)
+                merged.save(pdf_path, garbage=3, deflate=True)
+                merged.close()
+            else:
+                doc.save(pdf_path, garbage=3, deflate=True)
+                doc.close()
             if self.is_stopped:
                 return pdf_path, "已停止(部分页生成)"
             return pdf_path, "双层PDF生成成功(本地OCR)"
@@ -4310,19 +4669,21 @@ class JpgToPdfWorker(QThread):
         ofd_filename = ""
         
         try:
-            # 输出结构(与分件一致): 输出目录/顶层目录名/子目录名/子目录名.pdf
+            # 输出结构: 输出目录/父目录名/子目录名.pdf —— PDF/OFD生成在
+            # 与源子目录同名的「上一级」目录下, 不再建同名子目录。
             # 例: 源 D:\扫描\J380-ZY·2021-Y-FGC-0001\J380-0001\*.jpg
-            #     → 输出 PDF目录\J380-ZY·2021-Y-FGC-0001\J380-0001\J380-0001.pdf
-            # dir_name 为当前子目录名; jpg_files[0]含完整路径可提取父目录链。
-            out_subdir = os.path.join(self.output_dir, dir_name)
-            # 源子目录相对源根的路径(可能多级), 保持层级镜像到输出目录
+            #     → 输出 PDF目录\J380-ZY·2021-Y-FGC-0001\J380-0001.pdf
+            # (rel的父目录 = 源子目录相对源根路径去掉最后一级)
+            out_subdir = self.output_dir
             src_root = getattr(self, 'directory_path', None)
             if src_root and jpg_files:
                 try:
                     src_dir = os.path.dirname(jpg_files[0])
                     rel = os.path.relpath(src_dir, src_root)
                     if rel and rel != '.':
-                        out_subdir = os.path.join(self.output_dir, rel)
+                        parent_rel = os.path.dirname(rel)
+                        if parent_rel:
+                            out_subdir = os.path.join(self.output_dir, parent_rel)
                 except Exception:
                     pass
             os.makedirs(out_subdir, exist_ok=True)
@@ -4346,9 +4707,22 @@ class JpgToPdfWorker(QThread):
         except Exception as e:
             result = "失败"
             ocr_status = f"错误: {str(e)}"
-        
+
+        # 每目录处理完强制回收: paddle推理的C++工作内存与图像缓存不归Python GC管,
+        # 长时间多目录累积会耗尽系统内存导致进程被静默终止。逐目录显式释放。
+        try:
+            import gc as _gc
+            _gc.collect()
+            try:
+                import paddle
+                paddle.device.cuda.empty_cache() if hasattr(paddle.device, 'cuda') else None
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         duration = round(time.time() - start_time, 2)
-        
+
         return {
             'folder': dir_name,
             'pdf_file': os.path.basename(result_pdf_path) if result_pdf_path else f"{dir_name}.pdf",
@@ -4437,11 +4811,27 @@ class JpgToPdfPage(FunctionPage):
         self.generate_ofd_check = QCheckBox("同时生成OFD文件")
         self.generate_ofd_check.setChecked(True)  # 默认选中
 
+        # GPU渲染: 图像处理走加速路径(MKL-DNN指令集加速+无损图像直传), 缺省不选
+        self.gpu_render_check = QCheckBox("使用GPU渲染(图像加速处理)")
+        self.gpu_render_check.setChecked(False)
+        self.gpu_render_check.setToolTip(
+            "勾选后图像处理启用加速路径(MKL-DNN指令集+无损图像直传), "
+            "生成结果完全相同, 高配置机器上更快")
+
+        # GPU OCR: paddlepaddle-gpu 推理, 缺省不选(CPU)
+        self.gpu_ocr_check = QCheckBox("OCR使用GPU处理(需GPU版paddle环境)")
+        self.gpu_ocr_check.setChecked(False)
+        self.gpu_ocr_check.setToolTip(
+            "勾选后OCR推理尝试使用GPU(需已安装paddlepaddle-gpu及CUDA); "
+            "不可用时自动回退CPU, 业务处理能力不变")
+
         form.addRow("图片目录:", h1)
         form.addRow("输出目录:", h2)
         form.addRow("线程数:", self.thread_spin)
         form.addRow("PDF DPI:", self.dpi_spin)
         form.addRow("选项:", self.generate_ofd_check)
+        form.addRow("渲染:", self.gpu_render_check)
+        form.addRow("OCR:", self.gpu_ocr_check)
         group.setLayout(form)
         self.layout.addWidget(group)
         
@@ -4503,7 +4893,40 @@ class JpgToPdfPage(FunctionPage):
         if d:
             self.out_dir.setText(d)
             self._out_manual = True  # 手动指定后不再跟随源目录
-    
+
+    def _check_gpu_capability(self):
+        """
+        检测设备GPU加速能力。返回 (支持?, 原因说明)。
+        检测项(不影响paddle导入状态):
+          1. NVIDIA驱动: nvcuda.dll 可加载(ctypes);
+          2. GPU版paddle: paddle编译了CUDA(is_compiled_with_cuda);
+          3. 可见GPU设备数 > 0。
+        """
+        # 1. NVIDIA驱动
+        try:
+            import ctypes
+            try:
+                ctypes.CDLL('nvcuda.dll')
+                has_driver = True
+            except OSError:
+                has_driver = False
+        except Exception:
+            has_driver = False
+        if not has_driver:
+            return False, "未检测到NVIDIA显卡驱动(nvcuda.dll不可用)"
+
+        # 2/3. paddle编译与设备数(此时paddle可能被导入, 但仅查询不初始化设备)
+        try:
+            import paddle
+            if not paddle.device.is_compiled_with_cuda():
+                return False, "当前为CPU版paddlepaddle(未安装paddlepaddle-gpu)"
+            n_gpu = int(paddle.device.cuda.device_count())
+            if n_gpu <= 0:
+                return False, "有NVIDIA驱动但paddle未识别到可用GPU设备"
+            return True, f"检测到{n_gpu}个GPU设备"
+        except Exception as e:
+            return False, f"paddle检测异常: {str(e)[:60]}"
+
     def execute(self):
         d = self.img_dir.text()
         out = self.out_dir.text()
@@ -4551,6 +4974,23 @@ class JpgToPdfPage(FunctionPage):
         self.log(f"输出目录: {out}")
         self.log(f"线程数: {self.thread_spin.value()}")
         self.log(f"PDF DPI: {self.dpi_spin.value()}")
+
+        # ---- GPU选项预检: 勾选GPU但设备不支持时, 开始前弹窗提示(将降级CPU) ----
+        want_gpu = (self.gpu_render_check.isChecked()
+                    or self.gpu_ocr_check.isChecked())
+        if want_gpu:
+            gpu_ok, gpu_reason = self._check_gpu_capability()
+            if not gpu_ok:
+                QMessageBox.warning(
+                    self, "GPU不可用提示",
+                    "您勾选了GPU选项, 但当前设备不支持GPU加速:\n"
+                    f"  {gpu_reason}\n\n"
+                    "系统将自动降级为CPU处理(处理结果完全相同, 仅速度较慢)。\n"
+                    "如需GPU加速, 请确认:\n"
+                    "  1. 机器配有NVIDIA显卡且已安装驱动;\n"
+                    "  2. 已安装GPU版paddlepaddle(paddlepaddle-gpu)。")
+                self.log(f"GPU预检: 不支持({gpu_reason}) → 降级CPU处理")
+
         self.log("="*50)
         
         # 创建工作线程
@@ -4562,7 +5002,9 @@ class JpgToPdfPage(FunctionPage):
             output_dir=out,
             max_workers=max_workers,
             resolution=resolution,
-            generate_ofd=generate_ofd
+            generate_ofd=generate_ofd,
+            gpu_render=self.gpu_render_check.isChecked(),
+            use_gpu_ocr=self.gpu_ocr_check.isChecked()
         )
         
         self.worker.log_signal.connect(self.log)
